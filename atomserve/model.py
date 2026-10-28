@@ -1,10 +1,12 @@
 # The Qwen3 transformer, written as plain functions over plain tensors.
 #
-# Input is a *flat* list of T tokens (no batch dimension) and their positions.
-# Output is one hidden vector per token; `compute_logits` turns the rows we
-# actually sample from into vocabulary scores. Keeping those two steps apart
-# matters: the lm_head is a 151,936 x 1024 matmul, so we only run it on rows
-# that need a next-token prediction.
+# Input is a *flat batch*: the new tokens of several sequences concatenated
+# into one list of T tokens, with no batch dimension and no padding (see
+# `Batch`). Every matmul runs on all T rows at once without caring which
+# sequence a row belongs to; attention is the only step that has to know
+# where each sequence starts and ends. Output is logits only for the rows we
+# sample from: the lm_head is a 151,936 x 1024 matmul, far too expensive to
+# run on every prompt token.
 #
 # One decoder layer, pre-norm style:
 #     x = x + attention(rmsnorm(x))
@@ -19,7 +21,7 @@ import torch
 import torch.nn.functional as F
 
 from atomserve.config import ModelConfig
-from atomserve.kv_cache import KVCache
+from atomserve.kv_cache import KVPool
 
 
 @dataclass
@@ -47,6 +49,33 @@ class Weights:
     layers: list[LayerWeights]
     final_norm: torch.Tensor  # [hidden]
     lm_head: torch.Tensor  # [vocab, hidden]  same tensor as `embed` when tied
+
+
+@dataclass
+class Batch:
+    """One forward pass worth of tokens from B sequences, flattened. Built by the runner.
+
+    input_ids:     [T]  new tokens of all sequences, concatenated
+    positions:     [T]  absolute position of each token (drives RoPE and the causal mask)
+    slot_mapping:  [T]  pool slot each token's K/V is written to
+    cu_seqlens:    B+1 host ints; sequence i's tokens are rows cu_seqlens[i]:cu_seqlens[i+1]
+    context_slots: [sum of context lengths]  pool slots of every token each sequence
+                   attends to (cached prefix + new tokens), sequences concatenated
+    cu_ctxlens:    B+1 host ints; sequence i's context is context_slots[cu_ctxlens[i]:...]
+    logits_idx:    [B']  rows that need a next-token prediction (a sequence's last row,
+                   once its prompt is fully processed)
+
+    The offsets are host ints because attention loops over sequences in Python
+    and slices with them; reading them off the GPU would force a sync per layer.
+    """
+
+    input_ids: torch.Tensor
+    positions: torch.Tensor
+    slot_mapping: torch.Tensor
+    cu_seqlens: list[int]
+    context_slots: torch.Tensor
+    cu_ctxlens: list[int]
+    logits_idx: torch.Tensor
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -117,10 +146,12 @@ def attention(
     q_positions: [T]                          absolute position of each query
     returns      [T, num_heads, head_dim]
 
-    A query at position p may attend to keys at positions 0..p. Without a cache,
-    S == T and this is the familiar lower-triangular mask; with a cache, the new
-    queries sit at the *end* of the sequence and see the whole cached prefix. A
-    single decode query (T == 1, p == S-1) sees everything, so no mask is built.
+    A query at position p may attend to keys at positions 0..p. For a fresh
+    sequence S == T and this is the familiar lower-triangular mask; with cached
+    tokens the new queries sit at the *end* of the sequence and see the whole
+    prefix. A single decode query (T == 1, p == S-1) sees everything, so no mask
+    is built. SDPA's own `is_causal=True` would be wrong here: it aligns the
+    triangle to the top-left, as if the queries started at position 0.
 
     With grouped-query attention (GQA) several query heads share one key/value
     head (16 query heads over 8 kv heads for 0.6B); `enable_gqa` does that sharing
@@ -141,15 +172,35 @@ def attention(
     return out.transpose(0, 1)
 
 
+def paged_attention(q: torch.Tensor, pool: KVPool, layer_idx: int, batch: Batch) -> torch.Tensor:
+    """Attention for every sequence of a flat batch, reading K/V from the paged pool.
+
+    q:       [T, num_heads, head_dim]  queries for all new tokens of the batch
+    returns  [T, num_heads, head_dim]
+
+    The one place the model looks at sequence boundaries: each sequence's
+    queries may only see its own keys. This version loops over sequences,
+    gathering each one's K/V out of its blocks into a contiguous tensor; correct
+    and obvious, and the first thing the optimization phase replaces.
+    """
+    out = torch.empty_like(q)
+    for i in range(len(batch.cu_seqlens) - 1):
+        rows = slice(batch.cu_seqlens[i], batch.cu_seqlens[i + 1])
+        slots = batch.context_slots[batch.cu_ctxlens[i] : batch.cu_ctxlens[i + 1]]
+        k, v = pool.read(layer_idx, slots)  # [context_len, num_kv_heads, head_dim]
+        out[rows] = attention(q[rows], k, v, batch.positions[rows])
+    return out
+
+
 def attention_block(
     x: torch.Tensor,
     layer: LayerWeights,
     layer_idx: int,
-    positions: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
     config: ModelConfig,
-    cache: KVCache | None,
+    batch: Batch,
+    pool: KVPool,
 ) -> torch.Tensor:
     """The attention half of a decoder layer (after its input RMSNorm).
 
@@ -157,10 +208,9 @@ def attention_block(
 
     Project to per-head q/k/v, RMSNorm each q and k head (Qwen3's addition over
     Llama: keeps attention logits well-scaled), rotate q and k by position,
-    attend, then mix the heads back to the hidden size with o_proj.
-
-    With a cache, the new keys/values are appended to it and attention reads the
-    full history back out, so past tokens are never re-projected.
+    store the new k/v in the pool, attend, then mix the heads back to the
+    hidden size with o_proj. Writing before attending means each new token sees
+    its own key, and past tokens are never re-projected.
     """
     T = x.shape[0]
     q = F.linear(x, layer.q_proj).view(T, config.num_heads, config.head_dim)
@@ -172,9 +222,8 @@ def attention_block(
     q = apply_rope(q, cos, sin)
     k = apply_rope(k, cos, sin)
 
-    if cache is not None:
-        k, v = cache.append(layer_idx, k, v)  # now [cached + T, num_kv_heads, head_dim]
-    out = attention(q, k, v, positions)  # [T, num_heads, head_dim]
+    pool.write(layer_idx, k, v, batch.slot_mapping)
+    out = paged_attention(q, pool, layer_idx, batch)  # [T, num_heads, head_dim]
     return F.linear(out.reshape(T, config.num_heads * config.head_dim), layer.o_proj)
 
 
@@ -191,33 +240,24 @@ def mlp_block(x: torch.Tensor, layer: LayerWeights) -> torch.Tensor:
     )
 
 
-def forward(
-    weights: Weights,
-    config: ModelConfig,
-    input_ids: torch.Tensor,
-    positions: torch.Tensor,
-    cache: KVCache | None = None,
-) -> torch.Tensor:
-    """Run the whole decoder stack over new tokens of one sequence.
+def forward(weights: Weights, config: ModelConfig, batch: Batch, pool: KVPool) -> torch.Tensor:
+    """Run the decoder stack over a flat batch; return next-token logits.
 
-    input_ids: [T]  token ids
-    positions: [T]  absolute position of each token
-    cache:     optional KV cache holding the sequence's earlier tokens
-    returns    [T, hidden]  final-normed hidden state per token
+    returns [len(batch.logits_idx), vocab]  fp32 logits, one row per sampling sequence
 
-    Without a cache, `input_ids` must be the whole sequence and every call costs
-    O(T^2) attention work. With a cache, pass only the tokens not yet seen: the
-    whole prompt once ("prefill"), then one token per step ("decode").
+    Side effect: the K/V of every token in the batch are written to `pool`, so
+    the next call only has to pass tokens not yet seen. That makes the same
+    function serve prefill (a whole prompt), decode (one token) and any mix of
+    the two across sequences.
     """
-    x = weights.embed[input_ids]  # [T, hidden]
-    cos, sin = rope_cos_sin(positions, config.head_dim, config.rope_theta, x.dtype)
+    x = weights.embed[batch.input_ids]  # [T, hidden]
+    cos, sin = rope_cos_sin(batch.positions, config.head_dim, config.rope_theta, x.dtype)
     for i, layer in enumerate(weights.layers):
         h = rms_norm(x, layer.input_norm, config.rms_norm_eps)
-        x = x + attention_block(h, layer, i, positions, cos, sin, config, cache)
+        x = x + attention_block(h, layer, i, cos, sin, config, batch, pool)
         x = x + mlp_block(rms_norm(x, layer.post_attn_norm, config.rms_norm_eps), layer)
-    if cache is not None:
-        cache.advance(input_ids.shape[0])
-    return rms_norm(x, weights.final_norm, config.rms_norm_eps)
+    x = x[batch.logits_idx]  # drop rows nobody samples from before the expensive part
+    return compute_logits(weights, rms_norm(x, weights.final_norm, config.rms_norm_eps))
 
 
 def compute_logits(weights: Weights, hidden: torch.Tensor) -> torch.Tensor:

@@ -1,8 +1,9 @@
 # The simplest possible generation loop: one sequence, greedy.
 #
 # Scaffolding for the early milestones. It shows the core autoregressive loop
-# (predict one token, append it, repeat) before any engine machinery exists.
-# The scheduler and engine replace it in M5.
+# (predict one token, append it, repeat) on top of the paged KV pool and the
+# runner, doing by hand what the scheduler and engine take over in M5:
+# growing the block table and advancing the sequence after each step.
 #
 # Try it:
 #   uv run python -m atomserve.generate Qwen/Qwen3-0.6B "The capital of France is"
@@ -15,13 +16,28 @@ from collections.abc import Iterator
 import torch
 from tokenizers import Tokenizer
 
+from atomserve.block_allocator import BlockAllocator, blocks_for_tokens
 from atomserve.config import ModelConfig
-from atomserve.kv_cache import KVCache
+from atomserve.kv_cache import KVPool
 from atomserve.loader import default_device, load_weights, resolve_model_dir
-from atomserve.model import Weights, compute_logits, forward
+from atomserve.model import Weights
+from atomserve.runner import ModelRunner
+from atomserve.sequence import Sequence
 
 # Peak unified-memory bandwidth of the M4 Pro, used for the decode speed ceiling.
 M4_PRO_BANDWIDTH_GBS = 273.0
+BLOCK_SIZE = 16  # tokens per KV block
+
+
+def reserve_blocks(seq: Sequence, allocator: BlockAllocator, block_size: int) -> None:
+    """Grow `seq.block_table` until it has a slot for every one of its tokens.
+
+    A sequence needs a new block only every `block_size` tokens; in between,
+    decode steps write into the free tail of its last block.
+    """
+    needed = blocks_for_tokens(len(seq.token_ids), block_size) - len(seq.block_table)
+    if needed > 0:
+        seq.block_table.extend(allocator.allocate(needed))
 
 
 @torch.inference_mode()
@@ -35,24 +51,27 @@ def iter_greedy(
 ) -> Iterator[int]:
     """Greedily extend `prompt_ids`, yielding each new token id as soon as it is chosen.
 
-    With the cache: one forward pass over the whole prompt fills the cache
-    (prefill), then every step feeds only the single newest token (decode).
-    Without it: every step re-runs the model over prompt + everything generated
-    so far, recomputing keys/values that have not changed (O(N^2) work).
+    With the cache: the first step runs the whole prompt (prefill), then every
+    step feeds only the single newest token (decode), its K/V appended to the pool.
+    Without it: every step frees the sequence's blocks and re-runs prompt +
+    everything generated so far, recomputing K/V that have not changed (O(N^2) work).
     """
-    device = weights.embed.device
-    ids = list(prompt_ids)
-    cache = None
-    if use_cache:
-        cache = KVCache(config, len(ids) + max_new_tokens, device, weights.embed.dtype)
+    num_blocks = blocks_for_tokens(len(prompt_ids) + max_new_tokens, BLOCK_SIZE)
+    pool = KVPool(config, num_blocks, BLOCK_SIZE, weights.embed.device, weights.embed.dtype)
+    allocator = BlockAllocator(num_blocks)
+    runner = ModelRunner(weights, config, pool)
+    seq = Sequence(token_ids=list(prompt_ids))
 
     for _ in range(max_new_tokens):
-        start = cache.length if cache is not None else 0  # first position not yet processed
-        input_ids = torch.tensor(ids[start:], device=device)
-        positions = torch.arange(start, len(ids), device=device)
-        hidden = forward(weights, config, input_ids, positions, cache)
-        next_id = int(compute_logits(weights, hidden[-1:]).argmax(dim=-1))
-        ids.append(next_id)
+        if not use_cache:
+            allocator.free(seq.block_table)
+            seq.block_table, seq.num_computed_tokens = [], 0
+        reserve_blocks(seq, allocator, BLOCK_SIZE)
+        num_new = len(seq.token_ids) - seq.num_computed_tokens
+        logits = runner.run([seq], [num_new])  # [1, vocab]
+        seq.num_computed_tokens += num_new
+        next_id = int(logits[0].argmax())
+        seq.token_ids.append(next_id)
         yield next_id
         if next_id in stop_ids:
             return

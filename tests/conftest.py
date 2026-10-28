@@ -1,16 +1,101 @@
-# Shared fixtures for the slow tests that need real model weights.
-# Session-scoped so the checkpoint is read once per test run.
+# Shared fixtures.
+#
+# The tiny model is random weights at toy size on CPU: it runs the real code
+# paths (paged pool, runner, flat batch) in milliseconds, so invariants about
+# the engine can be fast tests. The real-model fixtures are session-scoped so
+# the checkpoint is read once per run.
 
+import dataclasses
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 import torch
 
+from atomserve.block_allocator import blocks_for_tokens
 from atomserve.config import ModelConfig
+from atomserve.kv_cache import KVPool
 from atomserve.loader import default_device, load_weights, resolve_model_dir
-from atomserve.model import Weights
+from atomserve.model import LayerWeights, Weights, forward
+from atomserve.runner import ModelRunner
+from atomserve.sequence import Sequence
 
 MODEL_ID = "Qwen/Qwen3-0.6B"
+
+TINY_CONFIG = ModelConfig(
+    vocab_size=50,
+    hidden_size=32,
+    intermediate_size=64,
+    num_layers=2,
+    num_heads=4,
+    num_kv_heads=2,
+    head_dim=8,
+    rms_norm_eps=1e-6,
+    rope_theta=10_000.0,
+    tie_word_embeddings=True,
+    max_position_embeddings=256,
+)
+
+
+@pytest.fixture(scope="session")
+def tiny_config() -> ModelConfig:
+    return TINY_CONFIG
+
+
+@pytest.fixture(scope="session")
+def tiny_weights() -> Weights:
+    """Random fp32 weights for TINY_CONFIG on CPU (seeded, so every run is the same)."""
+    c = TINY_CONFIG
+    g = torch.Generator().manual_seed(0)
+
+    def rand(*shape: int) -> torch.Tensor:
+        return torch.randn(*shape, generator=g) * 0.2
+
+    def norm(dim: int) -> torch.Tensor:
+        return 1.0 + rand(dim)
+
+    q_dim, kv_dim = c.num_heads * c.head_dim, c.num_kv_heads * c.head_dim
+    layers = [
+        LayerWeights(
+            input_norm=norm(c.hidden_size),
+            q_proj=rand(q_dim, c.hidden_size),
+            k_proj=rand(kv_dim, c.hidden_size),
+            v_proj=rand(kv_dim, c.hidden_size),
+            q_norm=norm(c.head_dim),
+            k_norm=norm(c.head_dim),
+            o_proj=rand(c.hidden_size, q_dim),
+            post_attn_norm=norm(c.hidden_size),
+            gate_proj=rand(c.intermediate_size, c.hidden_size),
+            up_proj=rand(c.intermediate_size, c.hidden_size),
+            down_proj=rand(c.hidden_size, c.intermediate_size),
+        )
+        for _ in range(c.num_layers)
+    ]
+    embed = rand(c.vocab_size, c.hidden_size)
+    return Weights(embed=embed, layers=layers, final_norm=norm(c.hidden_size), lm_head=embed)
+
+
+@pytest.fixture(scope="session")
+def full_logits() -> Callable[[Weights, ModelConfig, list[int]], torch.Tensor]:
+    """f(weights, config, ids) -> logits at every position [len(ids), vocab], on CPU.
+
+    Runs `ids` as one fresh prefill in a throwaway pool, asking for a logits row
+    per token instead of just the last one: the uncached reference that cached,
+    paged and batched runs are compared against.
+    """
+
+    def run(weights: Weights, config: ModelConfig, ids: list[int]) -> torch.Tensor:
+        block_size = 16
+        num_blocks = blocks_for_tokens(len(ids), block_size)
+        device, dtype = weights.embed.device, weights.embed.dtype
+        runner = ModelRunner(weights, config, KVPool(config, num_blocks, block_size, device, dtype))
+        seq = Sequence(token_ids=list(ids), block_table=list(range(num_blocks)))
+        batch = runner.prepare([seq], [len(ids)])
+        batch = dataclasses.replace(batch, logits_idx=torch.arange(len(ids), device=device))
+        with torch.inference_mode():
+            return forward(weights, config, batch, runner.pool).cpu()
+
+    return run
 
 
 @pytest.fixture(scope="session")

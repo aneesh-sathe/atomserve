@@ -1,93 +1,66 @@
-# KV cache tests. The fast ones check the bookkeeping on a tiny config (CPU); the
+# KV pool tests. The fast ones check storage addressing on a toy pool (CPU); the
 # slow ones prove, on the real model, that caching changes speed and nothing else.
 
 import pytest
 import torch
 
-from atomserve.config import ModelConfig
 from atomserve.generate import generate_greedy
-from atomserve.kv_cache import KVCache
-from atomserve.model import compute_logits, forward
+from atomserve.kv_cache import KVPool
+from atomserve.runner import ModelRunner, slot_of
+from atomserve.sequence import Sequence
 
-TINY = ModelConfig(
-    vocab_size=10,
-    hidden_size=8,
-    intermediate_size=16,
-    num_layers=2,
-    num_heads=4,
-    num_kv_heads=2,
-    head_dim=4,
-    rms_norm_eps=1e-6,
-    rope_theta=10_000.0,
-    tie_word_embeddings=True,
-    max_position_embeddings=64,
-)
+CPU = torch.device("cpu")
 
 
-def test_append_returns_full_history_and_advance_moves_length():
-    """append() exposes prefix + new tokens; length only moves once all layers wrote."""
-    cache = KVCache(TINY, max_len=8, device=torch.device("cpu"), dtype=torch.float32)
-    first = torch.randn(3, 2, 4)
-    for layer in range(TINY.num_layers):
-        k_all, _ = cache.append(layer, first, first)
-        assert k_all.shape == (3, 2, 4)
-    cache.advance(3)
-
-    second = torch.randn(1, 2, 4)
-    k_all, v_all = cache.append(0, second, second)
-    assert cache.length == 3
-    assert torch.equal(k_all, torch.cat([first, second]))
-    assert torch.equal(v_all, torch.cat([first, second]))
+def test_slot_of_follows_the_block_table():
+    """Position p lives at offset p % block_size inside block block_table[p // block_size]."""
+    table = [7, 2, 5]
+    assert [slot_of(table, p, 4) for p in (0, 3, 4, 5, 11)] == [28, 31, 8, 9, 23]
 
 
-def test_append_past_capacity_raises():
-    """Writing beyond max_len is an error, never a silent overwrite."""
-    cache = KVCache(TINY, max_len=4, device=torch.device("cpu"), dtype=torch.float32)
-    with pytest.raises(ValueError, match="KV cache full"):
-        cache.append(0, torch.randn(5, 2, 4), torch.randn(5, 2, 4))
+def test_write_then_read_round_trips_through_scattered_slots(tiny_config):
+    """Whatever slots a sequence's tokens land in, reading them back gives them in order."""
+    pool = KVPool(tiny_config, num_blocks=6, block_size=4, device=CPU, dtype=torch.float32)
+    k = torch.randn(5, tiny_config.num_kv_heads, tiny_config.head_dim)
+    v = torch.randn_like(k)
+    slots = torch.tensor([20, 21, 22, 23, 4])  # block 5 then block 1
+    pool.write(1, k, v, slots)
+    k_out, v_out = pool.read(1, slots)
+    assert torch.equal(k_out, k)
+    assert torch.equal(v_out, v)
+
+
+def test_layers_do_not_share_storage(tiny_config):
+    """Writing layer 0's slot 3 leaves layer 1's slot 3 untouched."""
+    pool = KVPool(tiny_config, num_blocks=2, block_size=4, device=CPU, dtype=torch.float32)
+    pool.k.zero_()
+    pool.v.zero_()
+    ones = torch.ones(1, tiny_config.num_kv_heads, tiny_config.head_dim)
+    pool.write(0, ones, ones, torch.tensor([3]))
+    assert torch.equal(pool.read(0, torch.tensor([3]))[0], ones)
+    assert pool.read(1, torch.tensor([3]))[0].abs().sum() == 0
 
 
 PROMPT = [785, 6722, 315, 9625, 374]  # "The capital of France is"
 
 
 @pytest.mark.slow
-def test_prefill_then_decode_logits_equal_full_recompute(weights_fp32, config):
+def test_prefill_then_decode_logits_equal_full_recompute(weights_fp32, config, full_logits):
     """At every step, the cached forward pass yields the same logits as recomputing
-    the whole sequence from scratch (fp32, so any mismatch is a real bug)."""
+    the whole sequence from scratch (fp32, so any mismatch is a real bug). With
+    block_size 4 the 13-token run crosses three block boundaries."""
     device = weights_fp32.embed.device
-    cache = KVCache(config, max_len=32, device=device, dtype=torch.float32)
-    ids = list(PROMPT)
+    pool = KVPool(config, num_blocks=4, block_size=4, device=device, dtype=torch.float32)
+    runner = ModelRunner(weights_fp32, config, pool)
+    seq = Sequence(token_ids=list(PROMPT), block_table=[3, 0, 2, 1])
 
-    def full_logits() -> torch.Tensor:
-        hidden = forward(
-            weights_fp32,
-            config,
-            torch.tensor(ids, device=device),
-            torch.arange(len(ids), device=device),
-        )
-        return compute_logits(weights_fp32, hidden)
-
-    with torch.inference_mode():
-        # Prefill: every prompt position must match.
-        hidden = forward(
-            weights_fp32,
-            config,
-            torch.tensor(ids, device=device),
-            torch.arange(len(ids), device=device),
-            cache,
-        )
-        assert (compute_logits(weights_fp32, hidden) - full_logits()).abs().max() < 1e-3
-
-        # Decode: feed one token at a time and compare the newest position.
-        for _ in range(8):
-            next_id = int(compute_logits(weights_fp32, hidden[-1:]).argmax())
-            ids.append(next_id)
-            pos = torch.tensor([len(ids) - 1], device=device)
-            hidden = forward(
-                weights_fp32, config, torch.tensor([next_id], device=device), pos, cache
-            )
-            assert (compute_logits(weights_fp32, hidden) - full_logits()[-1:]).abs().max() < 1e-3
-    assert cache.length == len(ids)
+    num_new = len(PROMPT)
+    for _ in range(9):
+        logits = runner.run([seq], [num_new]).cpu()
+        assert (logits - full_logits(weights_fp32, config, seq.token_ids)[-1:]).abs().max() < 1e-3
+        seq.num_computed_tokens += num_new
+        seq.token_ids.append(int(logits.argmax()))
+        num_new = 1
 
 
 @pytest.mark.slow

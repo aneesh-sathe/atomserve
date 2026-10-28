@@ -9,7 +9,6 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from atomserve.generate import generate_greedy
-from atomserve.model import compute_logits, forward
 
 pytestmark = pytest.mark.slow
 
@@ -32,26 +31,16 @@ def prompts(model_dir) -> dict[str, list[int]]:
     return {"raw": tok(RAW_PROMPT).input_ids, "chat": tok(chat).input_ids}
 
 
-def our_logits(weights, config, ids: list[int]) -> torch.Tensor:
-    """Logits for every position of `ids`, from our model, on CPU in fp32."""
-    device = weights.embed.device
-    with torch.inference_mode():
-        hidden = forward(
-            weights, config, torch.tensor(ids, device=device), torch.arange(len(ids), device=device)
-        )
-        return compute_logits(weights, hidden).cpu()
-
-
 def hf_logits(hf_model, ids: list[int]) -> torch.Tensor:
     with torch.inference_mode():
         return hf_model(torch.tensor([ids])).logits[0].float()
 
 
 @pytest.mark.parametrize("kind", ["raw", "chat"])
-def test_fp32_logits_match_reference(kind, prompts, weights_fp32, config, hf_model):
+def test_fp32_logits_match_reference(kind, prompts, weights_fp32, config, hf_model, full_logits):
     """Every position's logits agree with the reference to within fp32 noise."""
     ids = prompts[kind]
-    ours, ref = our_logits(weights_fp32, config, ids), hf_logits(hf_model, ids)
+    ours, ref = full_logits(weights_fp32, config, ids), hf_logits(hf_model, ids)
     assert ours.shape == ref.shape
     assert (ours - ref).abs().max() < 1e-3  # observed ~1.3e-4 on logits of magnitude ~37
     assert torch.equal(ours.argmax(-1), ref.argmax(-1))
@@ -69,10 +58,10 @@ def test_greedy_generation_matches_reference(kind, prompts, weights_fp32, config
     assert ours == ref
 
 
-def test_bf16_logits_close_to_reference(prompts, weights_bf16, config, hf_model):
+def test_bf16_logits_close_to_reference(prompts, weights_bf16, config, hf_model, full_logits):
     """In bf16 (the serving dtype) logits stay close and the top prediction agrees."""
     ids = prompts["chat"]
-    ours, ref = our_logits(weights_bf16, config, ids), hf_logits(hf_model, ids)
+    ours, ref = full_logits(weights_bf16, config, ids), hf_logits(hf_model, ids)
     cosine = torch.nn.functional.cosine_similarity(ours, ref, dim=-1)
     assert cosine.min() > 0.99
     assert ours[-1].argmax() == ref[-1].argmax()

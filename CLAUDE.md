@@ -11,6 +11,10 @@ Full spec and milestones: `~/.claude/plans/i-want-to-build-tidy-stream.md`.
 - Code is the doc: every file has a header comment on its concept; every function a docstring with
   purpose, tensor shapes and the non-obvious "why". No separate design docs; README is install + usage.
 - Built milestone by milestone (M0-M8); the user reviews each before the next starts.
+- M4 was built before M3 at the user's request; M3 (tokenizer, sampler, REPL) is still pending.
+- `block_allocator.py` is separate from `kv_cache.py` (plan had them together) so the scheduler
+  stays pure Python: the allocator tracks block ids, `KVPool` only holds tensors.
+- The runner never mutates a `Sequence`; the driver (generate.py now, scheduler from M5) does.
 
 ## Commands
 - `uv sync` - install (Python 3.14 pinned in `.python-version`; torch ships cp314 macOS wheels)
@@ -30,6 +34,13 @@ Full spec and milestones: `~/.claude/plans/i-want-to-build-tidy-stream.md`.
 - Baseline perf (M2, bf16, single seq, M4 Pro): decode ~80 tok/s vs a ~229 tok/s bandwidth ceiling
   (1.19 GB weights/step at 273 GB/s), so decode is overhead-bound. 1000-token prompt: prefill ~270 ms;
   decode 74 tok/s with cache vs 3.6 tok/s without. Always warm up MPS before timing.
+- M4 paged path (bf16): single seq decode ~74 tok/s (short) / ~67 tok/s (1000 ctx), ~10% below M2
+  because each layer gathers the sequence's K/V out of its blocks (`index_select` copy).
+  Lockstep decode, 100-token prompts, aggregate tok/s: B=1 73, B=4 244, B=8 396, B=16 460, B=32 637.
+  Step time grows with B mostly from the per-sequence Python loop in `paged_attention`.
+- `tensor.view(-1, ...)` of a pool layer + `index_copy_` / `index_select` scatter/gather slots correctly on MPS.
+- Fast tests run the full paged model on a tiny random-weight config on CPU (`tiny_weights` fixture);
+  use it for engine invariants instead of the real model where possible.
 - Importing `transformers` prints a harmless torch.distributed "Redirects" warning on macOS; the engine never imports it.
 
 ## Conventions
