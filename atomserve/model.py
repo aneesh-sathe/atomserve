@@ -19,6 +19,7 @@ import torch
 import torch.nn.functional as F
 
 from atomserve.config import ModelConfig
+from atomserve.kv_cache import KVCache
 
 
 @dataclass
@@ -106,24 +107,35 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     return x * cos[:, None, :] + rotated * sin[:, None, :]
 
 
-def causal_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """Scaled dot-product attention of one sequence over itself, causally masked.
+def attention(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, q_positions: torch.Tensor
+) -> torch.Tensor:
+    """Causal scaled dot-product attention of new queries over all keys of one sequence.
 
-    q: [T, num_heads, head_dim]
-    k: [T, num_kv_heads, head_dim]
-    v: [T, num_kv_heads, head_dim]
-    returns [T, num_heads, head_dim]
+    q:           [T, num_heads, head_dim]     queries for the T new tokens
+    k, v:        [S, num_kv_heads, head_dim]  keys/values for positions 0..S-1 (S >= T)
+    q_positions: [T]                          absolute position of each query
+    returns      [T, num_heads, head_dim]
 
-    Token t may only attend to tokens 0..t. With grouped-query attention (GQA)
-    several query heads share one key/value head (16 query heads over 8 kv heads
-    for 0.6B); `enable_gqa` does that sharing without copying K/V. The softmax
-    scale is the standard 1/sqrt(head_dim).
+    A query at position p may attend to keys at positions 0..p. Without a cache,
+    S == T and this is the familiar lower-triangular mask; with a cache, the new
+    queries sit at the *end* of the sequence and see the whole cached prefix. A
+    single decode query (T == 1, p == S-1) sees everything, so no mask is built.
+
+    With grouped-query attention (GQA) several query heads share one key/value
+    head (16 query heads over 8 kv heads for 0.6B); `enable_gqa` does that sharing
+    without copying K/V. The softmax scale is the standard 1/sqrt(head_dim).
     """
+    S = k.shape[0]
+    mask = None
+    if q.shape[0] > 1:
+        key_positions = torch.arange(S, device=q.device)
+        mask = key_positions[None, :] <= q_positions[:, None]  # [T, S], True = may attend
     out = F.scaled_dot_product_attention(
         q.transpose(0, 1),  # SDPA wants [heads, T, head_dim]
         k.transpose(0, 1),
         v.transpose(0, 1),
-        is_causal=True,
+        attn_mask=mask,
         enable_gqa=True,
     )
     return out.transpose(0, 1)
@@ -132,9 +144,12 @@ def causal_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch
 def attention_block(
     x: torch.Tensor,
     layer: LayerWeights,
+    layer_idx: int,
+    positions: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
     config: ModelConfig,
+    cache: KVCache | None,
 ) -> torch.Tensor:
     """The attention half of a decoder layer (after its input RMSNorm).
 
@@ -143,6 +158,9 @@ def attention_block(
     Project to per-head q/k/v, RMSNorm each q and k head (Qwen3's addition over
     Llama: keeps attention logits well-scaled), rotate q and k by position,
     attend, then mix the heads back to the hidden size with o_proj.
+
+    With a cache, the new keys/values are appended to it and attention reads the
+    full history back out, so past tokens are never re-projected.
     """
     T = x.shape[0]
     q = F.linear(x, layer.q_proj).view(T, config.num_heads, config.head_dim)
@@ -154,7 +172,9 @@ def attention_block(
     q = apply_rope(q, cos, sin)
     k = apply_rope(k, cos, sin)
 
-    out = causal_attention(q, k, v)  # [T, num_heads, head_dim]
+    if cache is not None:
+        k, v = cache.append(layer_idx, k, v)  # now [cached + T, num_kv_heads, head_dim]
+    out = attention(q, k, v, positions)  # [T, num_heads, head_dim]
     return F.linear(out.reshape(T, config.num_heads * config.head_dim), layer.o_proj)
 
 
@@ -172,24 +192,31 @@ def mlp_block(x: torch.Tensor, layer: LayerWeights) -> torch.Tensor:
 
 
 def forward(
-    weights: Weights, config: ModelConfig, input_ids: torch.Tensor, positions: torch.Tensor
+    weights: Weights,
+    config: ModelConfig,
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    cache: KVCache | None = None,
 ) -> torch.Tensor:
-    """Run the whole decoder stack over one sequence, with no cache.
+    """Run the whole decoder stack over new tokens of one sequence.
 
     input_ids: [T]  token ids
-    positions: [T]  absolute position of each token (0..T-1 for a fresh sequence)
+    positions: [T]  absolute position of each token
+    cache:     optional KV cache holding the sequence's earlier tokens
     returns    [T, hidden]  final-normed hidden state per token
 
-    Every call recomputes attention over the full sequence, so generating N
-    tokens costs O(N^2) work. The KV cache (next milestone) removes that.
+    Without a cache, `input_ids` must be the whole sequence and every call costs
+    O(T^2) attention work. With a cache, pass only the tokens not yet seen: the
+    whole prompt once ("prefill"), then one token per step ("decode").
     """
     x = weights.embed[input_ids]  # [T, hidden]
     cos, sin = rope_cos_sin(positions, config.head_dim, config.rope_theta, x.dtype)
-    for layer in weights.layers:
-        x = x + attention_block(
-            rms_norm(x, layer.input_norm, config.rms_norm_eps), layer, cos, sin, config
-        )
+    for i, layer in enumerate(weights.layers):
+        h = rms_norm(x, layer.input_norm, config.rms_norm_eps)
+        x = x + attention_block(h, layer, i, positions, cos, sin, config, cache)
         x = x + mlp_block(rms_norm(x, layer.post_attn_norm, config.rms_norm_eps), layer)
+    if cache is not None:
+        cache.advance(input_ids.shape[0])
     return rms_norm(x, weights.final_norm, config.rms_norm_eps)
 
 

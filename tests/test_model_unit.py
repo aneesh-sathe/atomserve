@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from atomserve.config import ModelConfig
-from atomserve.model import apply_rope, causal_attention, rms_norm, rope_cos_sin
+from atomserve.model import apply_rope, attention, rms_norm, rope_cos_sin
 
 torch.manual_seed(0)
 
@@ -64,17 +64,33 @@ def naive_causal_attention(q, k, v):
     return torch.einsum("hts,shd->thd", probs, v)
 
 
-def test_causal_attention_matches_naive_reference_with_gqa():
+def causal(q, k, v):
+    """attention() for a fresh sequence: T new queries at positions 0..T-1 over T keys."""
+    return attention(q, k, v, torch.arange(q.shape[0]))
+
+
+def test_attention_matches_naive_reference_with_gqa():
     """SDPA with enable_gqa equals the longhand definition (4 query heads over 2 kv heads)."""
     q, k, v = torch.randn(6, 4, 8), torch.randn(6, 2, 8), torch.randn(6, 2, 8)
-    assert torch.allclose(causal_attention(q, k, v), naive_causal_attention(q, k, v), atol=1e-5)
+    assert torch.allclose(causal(q, k, v), naive_causal_attention(q, k, v), atol=1e-5)
 
 
 def test_first_token_attends_only_to_itself():
     """Under the causal mask, token 0 sees only itself, so its output is exactly v[0]."""
     q, k, v = torch.randn(5, 4, 8), torch.randn(5, 2, 8), torch.randn(5, 2, 8)
-    out = causal_attention(q, k, v)
+    out = causal(q, k, v)
     assert torch.allclose(out[0], v[0].repeat_interleave(2, dim=0), atol=1e-6)
+
+
+def test_cached_queries_match_rows_of_full_attention():
+    """New queries at the end of a sequence, attending over all keys (what a KV cache does),
+    give exactly the rows that full causal attention would have produced for them."""
+    q, k, v = torch.randn(9, 4, 8), torch.randn(9, 2, 8), torch.randn(9, 2, 8)
+    full = causal(q, k, v)
+    # Chunk of 3 new tokens after a 6-token prefix (multi-token, needs the offset mask).
+    assert torch.allclose(attention(q[6:], k, v, torch.arange(6, 9)), full[6:], atol=1e-5)
+    # A single decode token sees everything.
+    assert torch.allclose(attention(q[8:], k, v, torch.tensor([8])), full[8:], atol=1e-5)
 
 
 def test_config_rejects_other_architectures():

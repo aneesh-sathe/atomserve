@@ -25,6 +25,11 @@ Full spec and milestones: `~/.claude/plans/i-want-to-build-tidy-stream.md`.
 - Golden tests: reference = transformers fp32 on CPU, eager attention. Ours fp32 on MPS differs by ~1.3e-4 max logit.
   bf16 vs fp32 reference: cosine ~0.999, occasional top-1 flips at individual positions (expected).
 - `F.scaled_dot_product_attention(..., enable_gqa=True)` works on MPS.
+- SDPA's `is_causal=True` aligns the mask top-left, which is wrong once queries sit after a cached prefix;
+  `model.attention` builds an explicit position-based mask instead (skipped for single-token decode).
+- Baseline perf (M2, bf16, single seq, M4 Pro): decode ~80 tok/s vs a ~229 tok/s bandwidth ceiling
+  (1.19 GB weights/step at 273 GB/s), so decode is overhead-bound. 1000-token prompt: prefill ~270 ms;
+  decode 74 tok/s with cache vs 3.6 tok/s without. Always warm up MPS before timing.
 - Importing `transformers` prints a harmless torch.distributed "Redirects" warning on macOS; the engine never imports it.
 
 ## Conventions
