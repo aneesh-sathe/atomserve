@@ -1,0 +1,44 @@
+[project]
+name = "atomserve"
+version = "0.1.0"
+description = "A minimal, from-scratch LLM inference engine for Apple silicon (PyTorch MPS)."
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "torch>=2.14",
+    "safetensors>=0.6",
+    "tokenizers>=0.22",
+    "huggingface-hub>=0.35",
+    "jinja2>=3.1",
+]
+
+[project.scripts]
+atomserve = "atomserve.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "ruff>=0.13",
+    "transformers>=4.57",  # golden tests only; never imported by the engine
+]
+
+[build-system]
+requires = ["uv_build>=0.9,<0.13"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-root = ""
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not slow' --strict-markers"
+markers = [
+    "slow: needs model weights and/or the GPU (run with: uv run pytest -m slow)",
+]
