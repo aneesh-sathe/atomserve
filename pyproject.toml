@@ -17,6 +17,7 @@ atomserve = "atomserve.cli:main"
 
 [dependency-groups]
 dev = [
+    "openai>=3.41.0",  # server e2e tests only
     "pytest>=8",
     "ruff>=0.13",
     "transformers>=4.57",  # golden tests only; never imported by the engine

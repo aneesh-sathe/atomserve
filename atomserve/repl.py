@@ -14,12 +14,9 @@ from dataclasses import replace
 from typing import TextIO
 
 from atomserve.engine import Engine, RequestHandle
-from atomserve.sequence import SamplingParams
+from atomserve.sequence import NON_THINKING_PARAMS, THINKING_PARAMS, SamplingParams
 from atomserve.tokenizer import ChatTokenizer, IncrementalDetokenizer
 
-# Sampling the Qwen3 model card recommends for each mode.
-THINKING_PARAMS = SamplingParams(temperature=0.6, top_p=0.95, top_k=20)
-NON_THINKING_PARAMS = SamplingParams(temperature=0.7, top_p=0.8, top_k=20)
 TUNABLE = {"temperature": float, "top_p": float, "top_k": int, "presence_penalty": float}
 TUNABLE |= {"max_tokens": int, "seed": int}
 

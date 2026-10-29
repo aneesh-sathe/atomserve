@@ -43,6 +43,11 @@ class SamplingParams:
     ignore_eos: bool = False
 
 
+# Qwen3's recommended sampling for each mode (model card); used as request defaults.
+THINKING_PARAMS = SamplingParams(temperature=0.6, top_p=0.95, top_k=20)
+NON_THINKING_PARAMS = SamplingParams(temperature=0.7, top_p=0.8, top_k=20)
+
+
 @dataclass(eq=False)
 class Sequence:
     """Mutable state of one request inside the engine.

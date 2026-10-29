@@ -23,7 +23,9 @@ Full spec and milestones: `~/.claude/plans/i-want-to-build-tidy-stream.md`.
 - `uv run pytest` - fast tests (default excludes `slow`)
 - `uv run pytest -m slow` - tests needing model weights / GPU
 
-- `uv run atomserve Qwen/Qwen3-0.6B` - chat REPL (`/help` inside)
+- `uv run atomserve Qwen/Qwen3-0.6B` - chat REPL (`/help` inside) + HTTP API on :11435
+- `uv run atomserve Qwen/Qwen3-0.6B --no-repl --port 11499` - API only (logs requests)
+- `uv run python bench/load.py --url http://127.0.0.1:11499 --concurrency 1,4,16,32` - load test
 
 ## Pitfalls / verified facts
 - Qwen3-0.6B ships `lm_head.weight` even though `tie_word_embeddings=true`; follow the config (use the embedding).
@@ -42,6 +44,10 @@ Full spec and milestones: `~/.claude/plans/i-want-to-build-tidy-stream.md`.
 - `tensor.view(-1, ...)` of a pool layer + `index_copy_` / `index_select` scatter/gather slots correctly on MPS.
 - Fast tests run the full paged model on a tiny random-weight config on CPU (`tiny_weights` fixture);
   use it for engine invariants instead of the real model where possible.
+- M6 bench (bf16, 128 output tokens, HTTP streaming): aggregate 72 / 221 / 445 / 609 tok/s at
+  concurrency 1 / 4 / 16 / 32; TTFT p50 23 / 61 / 171 / 250 ms.
+- Greedy outputs of identical requests can differ under bf16 when batch composition changes
+  (different matmul shapes round differently). In fp32 they are identical, so invariance tests use fp32.
 - E2E terminal tests must use `pty.fork()` (a real controlling tty) or Ctrl-C never becomes SIGINT.
   Pause ~0.3 s after the prompt appears before typing, and never `waitpid` without a timeout.
 - Qwen3-0.6B sometimes loops forever while thinking on trick prompts; that is the model, not the engine.
