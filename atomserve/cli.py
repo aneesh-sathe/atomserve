@@ -35,6 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="atomserve",
         description="Run a Hugging Face model locally and chat with it in the terminal.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "model",
@@ -47,7 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--dtype", choices=DTYPES, default="bf16", help="weights and KV cache")
     parser.add_argument(
-        "--kv-mem-gb", type=float, default=4.0, help="GiB of memory for the KV cache (default 4)"
+        "--kv-mem-gb", type=float, default=4.0, help="GiB of memory for the KV cache"
     )
     parser.add_argument("--block-size", type=int, default=16, help="tokens per KV block")
     parser.add_argument(
@@ -58,7 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=512,
         help="token budget of one forward pass; smaller bounds the stall a long prompt "
-        "causes running streams, larger prefills a little faster (default 512)",
+        "causes running streams, larger prefills a little faster",
     )
     parser.add_argument(
         "--no-prefix-caching", action="store_true", help="always recompute shared prompt prefixes"

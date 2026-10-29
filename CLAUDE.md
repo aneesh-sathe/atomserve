@@ -9,7 +9,9 @@ Full spec and milestones: `~/.claude/plans/i-want-to-build-tidy-stream.md`.
 - Plain tensors and functions; `transformers` is a dev dependency for golden tests only, never imported by `atomserve/`.
 - One process: engine thread + chat REPL + OpenAI-compatible HTTP (stdlib `http.server`). No asyncio.
 - Code is the doc: every file has a header comment on its concept; every function a docstring with
-  purpose, tensor shapes and the non-obvious "why". No separate design docs; README is install + usage.
+  purpose, tensor shapes and the non-obvious "why". No separate design docs.
+- README.md is the one overview doc: comprehensive, succinct, technically detailed (user request).
+  Keep its numbers and module map in sync when behavior or measurements change.
 - Built milestone by milestone (M0-M8); the user reviews each before the next starts.
 - M4 was built before M3 at the user's request.
 - `block_allocator.py` is separate from `kv_cache.py` (plan had them together) so the scheduler
@@ -60,7 +62,8 @@ Full spec and milestones: `~/.claude/plans/i-want-to-build-tidy-stream.md`.
 - E2E terminal tests need the pty as the child's *controlling* tty or Ctrl-C never becomes SIGINT.
   Don't use `pty.fork()` inside pytest (forking a multi-threaded process can deadlock the child);
   `tests/test_repl.py` spawns via subprocess + `TIOCSCTTY`. Pause ~0.3 s after the prompt before
-  typing, and never wait on the child without a timeout.
+  typing, and never wait on the child without a timeout. Keep reading the pty while waiting for
+  exit: macOS blocks a process's exit until its unread terminal output drains.
 - Qwen3-0.6B sometimes loops forever while thinking on trick prompts; that is the model, not the engine.
 - Importing `transformers` prints a harmless torch.distributed "Redirects" warning on macOS; the engine never imports it.
 
