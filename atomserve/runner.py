@@ -13,6 +13,7 @@
 
 import torch
 
+from atomserve import kernels
 from atomserve.block_allocator import blocks_for_tokens
 from atomserve.config import ModelConfig
 from atomserve.kv_cache import KVPool
@@ -29,12 +30,18 @@ def slot_of(block_table: list[int], position: int, block_size: int) -> int:
 class ModelRunner:
     """Owns the weights, KV pool and sampler; executes one step for a list of sequences."""
 
-    def __init__(self, weights: Weights, config: ModelConfig, pool: KVPool):
+    def __init__(
+        self, weights: Weights, config: ModelConfig, pool: KVPool, use_kernels: bool | None = None
+    ):
+        """use_kernels: run the Metal kernels in kernels.py (default: when available)."""
         self.weights = weights
         self.config = config
         self.pool = pool
         self.device = weights.embed.device
         self.sampler = Sampler(self.device)
+        if use_kernels is None:
+            use_kernels = kernels.available(self.device, weights.embed.dtype, config)
+        self.use_kernels = use_kernels
 
     def prepare(self, seqs: list[Sequence], num_new_tokens: list[int]) -> Batch:
         """Flatten one step's work into a Batch.
@@ -87,16 +94,22 @@ class ModelRunner:
             slot_mapping=self._to_device(slot_mapping),
             logits_idx=self._to_device(logits_idx),
             prefills=prefills,
+            use_kernels=self.use_kernels,
         )
         if decode_rows:
             width = max(len(t) for t in decode_tables)
             tables = self._to_device([t + [0] * (width - len(t)) for t in decode_tables])
-            longest = max(decode_lens)
             batch.decode_rows = self._to_device(decode_rows)
-            batch.decode_slots = self._expand_slots(tables, longest)
-            if min(decode_lens) < longest:
-                key_positions = torch.arange(longest, device=self.device)
-                batch.decode_mask = key_positions[None, :] < self._to_device(decode_lens)[:, None]
+            if self.use_kernels:
+                batch.decode_block_tables = tables
+                batch.decode_lens = self._to_device(decode_lens)
+                batch.decode_max_len = max(decode_lens)
+            else:
+                longest = max(decode_lens)
+                batch.decode_slots = self._expand_slots(tables, longest)
+                if min(decode_lens) < longest:
+                    positions = torch.arange(longest, device=self.device)
+                    batch.decode_mask = positions[None, :] < self._to_device(decode_lens)[:, None]
         return batch
 
     def _to_device(self, values: list) -> torch.Tensor:

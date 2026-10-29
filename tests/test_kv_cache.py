@@ -71,3 +71,10 @@ def test_engine_greedy_equals_argmax_of_full_recompute(weights_fp32, config, gre
     for _ in range(32):
         ids.append(int(full_logits(weights_fp32, config, ids)[-1].argmax()))
     assert cached == ids[len(PROMPT) :]
+
+
+def test_pool_starts_finite(tiny_config):
+    """Batched decode attention pads short contexts with never-written slots and masks
+    them; masking only works if those slots can't hold NaN (0 * NaN = NaN)."""
+    pool = KVPool(tiny_config, num_blocks=4, block_size=4, device=CPU, dtype=torch.float32)
+    assert torch.isfinite(pool.k).all() and torch.isfinite(pool.v).all()

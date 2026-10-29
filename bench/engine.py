@@ -3,7 +3,7 @@
 # The yardstick for optimization work. Every change should be measured with
 # this before and after, on an otherwise idle machine.
 #
-#   decode  B sequences (distinct 100-token prompts) generate 128 tokens each with
+#   decode  B sequences (distinct prompts of --context tokens) generate 128 tokens each with
 #           the default thinking-mode sampling; reports aggregate tok/s and the
 #           average step time.
 #   prefill one cold prompt of N tokens, one output token: time to first token.
@@ -42,13 +42,16 @@ def prompts(batch: int, length: int) -> list[list[int]]:
     return [[(1000 + 37 * b + i) % 150000 for i in range(length)] for b in range(batch)]
 
 
-def bench_decode(engine: Engine, batch: int, new_tokens: int) -> tuple[float, float]:
+def bench_decode(
+    engine: Engine, batch: int, new_tokens: int, context: int = 100
+) -> tuple[float, float]:
     """Returns (aggregate decode tok/s, average decode step in ms)."""
     params = SamplingParams(
         **{**vars(THINKING_PARAMS), "max_tokens": new_tokens, "ignore_eos": True}
     )
-    handles = [engine.submit(p, params) for p in prompts(batch, 100)]
-    engine.step()  # prefill everyone
+    handles = [engine.submit(p, params) for p in prompts(batch, context)]
+    while any(h.first_token_at is None for h in handles):  # prefill (maybe several chunks)
+        engine.step()
     torch.mps.synchronize()
     start, steps = time.perf_counter(), 0
     while engine.step():
@@ -66,15 +69,17 @@ def bench_prefill(engine: Engine, length: int) -> float:
     return (time.perf_counter() - start) * 1000
 
 
-def profile_decode(engine: Engine, batch: int, new_tokens: int) -> dict[str, float]:
+def profile_decode(
+    engine: Engine, batch: int, new_tokens: int, context: int = 100
+) -> dict[str, float]:
     """Average ms per decode step spent in each phase (synchronizing after the forward)."""
     runner, scheduler = engine.runner, engine.scheduler
     params = SamplingParams(
         **{**vars(THINKING_PARAMS), "max_tokens": new_tokens, "ignore_eos": True}
     )
-    for p in prompts(batch, 100):
-        engine.submit(p, params)
-    engine.step()
+    handles = [engine.submit(p, params) for p in prompts(batch, context)]
+    while any(h.first_token_at is None for h in handles):
+        engine.step()
     phases: dict[str, float] = defaultdict(float)
     steps = 0
     with torch.inference_mode():
@@ -111,6 +116,7 @@ def main() -> None:
     parser.add_argument("--batch", default="1,8,32", help="decode batch sizes")
     parser.add_argument("--prefill", default="1000,8000", help="prefill prompt lengths")
     parser.add_argument("--new-tokens", type=int, default=128)
+    parser.add_argument("--context", type=int, default=100, help="prompt length for decode runs")
     parser.add_argument("--profile", action="store_true", help="per-phase decode step breakdown")
     args = parser.parse_args()
 
@@ -123,10 +129,10 @@ def main() -> None:
         bench_prefill(engine, length)
 
     for batch in [int(b) for b in args.batch.split(",")]:
-        rate, step_ms = bench_decode(engine, batch, args.new_tokens)
+        rate, step_ms = bench_decode(engine, batch, args.new_tokens, args.context)
         print(f"decode  B={batch:<3} {rate:7.1f} tok/s   {step_ms:6.2f} ms/step", flush=True)
         if args.profile:
-            phases = profile_decode(engine, batch, args.new_tokens)
+            phases = profile_decode(engine, batch, args.new_tokens, args.context)
             print("        " + "  ".join(f"{k} {v:.2f}" for k, v in phases.items()), flush=True)
     for length in [int(n) for n in args.prefill.split(",") if n]:
         print(f"prefill {length:>5} tokens: TTFT {bench_prefill(engine, length):7.0f} ms")

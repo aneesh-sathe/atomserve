@@ -43,14 +43,12 @@ def tiny_config() -> ModelConfig:
     return TINY_CONFIG
 
 
-@pytest.fixture(scope="session")
-def tiny_weights() -> Weights:
-    """Random fp32 weights for TINY_CONFIG on CPU (seeded, so every run is the same)."""
-    c = TINY_CONFIG
-    g = torch.Generator().manual_seed(0)
+def random_weights(c: ModelConfig, device: str = "cpu", seed: int = 0) -> Weights:
+    """Seeded random fp32 weights of the right shapes for config `c`."""
+    g = torch.Generator().manual_seed(seed)
 
     def rand(*shape: int) -> torch.Tensor:
-        return torch.randn(*shape, generator=g) * 0.2
+        return (torch.randn(*shape, generator=g) * 0.2).to(device)
 
     def norm(dim: int) -> torch.Tensor:
         return 1.0 + rand(dim)
@@ -71,6 +69,12 @@ def tiny_weights() -> Weights:
     ]
     embed = rand(c.vocab_size, c.hidden_size)
     return Weights(embed=embed, layers=layers, final_norm=norm(c.hidden_size), lm_head=embed)
+
+
+@pytest.fixture(scope="session")
+def tiny_weights() -> Weights:
+    """Random fp32 weights for TINY_CONFIG on CPU (seeded, so every run is the same)."""
+    return random_weights(TINY_CONFIG)
 
 
 @pytest.fixture(scope="session")

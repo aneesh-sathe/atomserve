@@ -20,6 +20,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
+from atomserve import kernels
 from atomserve.config import ModelConfig
 from atomserve.kv_cache import KVPool
 
@@ -73,14 +74,17 @@ class Batch:
     For attention, the sequences are split by how many new tokens they bring:
     prefills:     sequences with several (prompt chunks), attended one at a time;
                   few per step, and each is a large piece of work on its own
-    decode_rows:  [Bd]    rows of the sequences with exactly one (decodes)
-    decode_slots: [Bd, L] pool slots of each decode's context, padded to the longest
-    decode_mask:  [Bd, L] True where decode_slots is a real key, False for padding;
-                  None when no padding is needed (all contexts equally long)
-                  (decode_rows/decode_slots are None when there are no decodes)
+    decode_rows:  [Bd] rows of the sequences with exactly one (decodes), or None
 
-    All decodes share one attention call: a step's launch cost then no longer
-    grows with the batch size.
+    All decodes share one attention call, so a step's launch cost doesn't grow
+    with the batch size. That call takes its keys in one of two forms:
+    use_kernels=True (Metal kernels, kernels.py): read in place from the pool
+      decode_block_tables: [Bd, max_blocks]  each decode's block table, padded
+      decode_lens:         [Bd]              its context length
+      decode_max_len:      host int          the longest context
+    use_kernels=False (plain PyTorch): gathered into a padded tensor first
+      decode_slots: [Bd, L] pool slots of each decode's context, padded to the longest
+      decode_mask:  [Bd, L] True where decode_slots is a real key; None if no padding
     """
 
     input_ids: torch.Tensor
@@ -88,7 +92,11 @@ class Batch:
     slot_mapping: torch.Tensor
     logits_idx: torch.Tensor
     prefills: list[PrefillSpan]
+    use_kernels: bool = False
     decode_rows: torch.Tensor | None = None
+    decode_block_tables: torch.Tensor | None = None
+    decode_lens: torch.Tensor | None = None
+    decode_max_len: int = 0
     decode_slots: torch.Tensor | None = None
     decode_mask: torch.Tensor | None = None
 
@@ -110,6 +118,15 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     return F.rms_norm(x, (x.shape[-1],), weight, eps)
 
 
+def rope_inv_freq(head_dim: int, theta: float, device: torch.device) -> torch.Tensor:
+    """RoPE frequency of each of the head_dim/2 coordinate pairs: theta^(-2i/head_dim).
+
+    returns [head_dim/2] fp32
+    """
+    exponents = torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim
+    return 1.0 / (theta**exponents)
+
+
 def rope_cos_sin(
     positions: torch.Tensor, head_dim: int, theta: float, dtype: torch.dtype
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -125,10 +142,7 @@ def rope_cos_sin(
     dimension i + head_dim/2 (the "rotate half" layout used by Qwen/Llama).
     Computed in fp32: large positions times small frequencies need the precision.
     """
-    inv_freq = 1.0 / (
-        theta
-        ** (torch.arange(0, head_dim, 2, device=positions.device, dtype=torch.float32) / head_dim)
-    )
+    inv_freq = rope_inv_freq(head_dim, theta, positions.device)
     angles = positions.float()[:, None] * inv_freq[None, :]  # [T, head_dim/2]
     angles = torch.cat([angles, angles], dim=-1)  # [T, head_dim]
     return angles.cos().to(dtype), angles.sin().to(dtype)
@@ -193,16 +207,24 @@ def paged_attention(q: torch.Tensor, pool: KVPool, layer_idx: int, batch: Batch)
     returns  [T, num_heads, head_dim]
 
     The one place the model looks at sequence boundaries: each sequence's
-    queries may only see its own keys. K/V are gathered out of the blocks into
-    contiguous tensors, then handed to SDPA.
+    queries may only see its own keys. Prompt chunks gather their K/V out of
+    the blocks and use SDPA; decodes go through one batched call.
     """
     if batch.decode_rows is not None:
-        Bd, L = batch.decode_slots.shape
-        k, v = pool.read(layer_idx, batch.decode_slots.view(-1))
-        k, v = k.view(Bd, L, *k.shape[1:]), v.view(Bd, L, *v.shape[1:])
+        q_dec = q if not batch.prefills else q.index_select(0, batch.decode_rows)
+        k_slots, v_slots = pool.layer_slots(layer_idx)
+        if batch.use_kernels:
+            decoded = kernels.paged_decode_attention(
+                q_dec, k_slots, v_slots, batch.decode_block_tables, batch.decode_lens,
+                pool.block_size, k_slots.shape[1], batch.decode_max_len,
+            )  # fmt: skip
+        else:
+            Bd, L = batch.decode_slots.shape
+            k, v = pool.read(layer_idx, batch.decode_slots.view(-1))
+            k, v = k.view(Bd, L, *k.shape[1:]), v.view(Bd, L, *v.shape[1:])
+            decoded = decode_attention(q_dec, k, v, batch.decode_mask)
         if not batch.prefills:  # a pure decode step: every row, in order
-            return decode_attention(q, k, v, batch.decode_mask)
-        decoded = decode_attention(q.index_select(0, batch.decode_rows), k, v, batch.decode_mask)
+            return decoded
     out = torch.empty_like(q)
     for span in batch.prefills:
         k, v = pool.read(layer_idx, span.context_slots)  # [context_len, num_kv_heads, head_dim]
@@ -239,15 +261,15 @@ def attention_block(
     x: torch.Tensor,
     layer: LayerWeights,
     layer_idx: int,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
+    rope: tuple[torch.Tensor, torch.Tensor] | torch.Tensor,
     config: ModelConfig,
     batch: Batch,
     pool: KVPool,
 ) -> torch.Tensor:
     """The attention half of a decoder layer (after its input RMSNorm).
 
-    x: [T, hidden]  ->  returns [T, hidden]
+    x:    [T, hidden]  ->  returns [T, hidden]
+    rope: (cos, sin) tables for the PyTorch path, or the frequencies for the kernel
 
     Project to per-head q/k/v, RMSNorm each q and k head (Qwen3's addition over
     Llama: keeps attention logits well-scaled), rotate q and k by position,
@@ -257,14 +279,21 @@ def attention_block(
     """
     T, H, KV = x.shape[0], config.num_heads, config.num_kv_heads
     qkv = F.linear(x, layer.qkv_proj).view(T, H + 2 * KV, config.head_dim)
-    q, k, v = qkv.split([H, KV, KV], dim=1)
 
-    q = rms_norm(q, layer.q_norm, config.rms_norm_eps)
-    k = rms_norm(k, layer.k_norm, config.rms_norm_eps)
-    q = apply_rope(q, cos, sin)
-    k = apply_rope(k, cos, sin)
+    if batch.use_kernels:  # everything up to the pool write, fused (kernels.py)
+        k_slots, v_slots = pool.layer_slots(layer_idx)
+        q = kernels.qk_norm_rope_store(
+            qkv, layer.q_norm, layer.k_norm, batch.positions, batch.slot_mapping, rope,
+            k_slots, v_slots, H, KV, config.rms_norm_eps,
+        )  # fmt: skip
+    else:
+        q, k, v = qkv.split([H, KV, KV], dim=1)
+        q = rms_norm(q, layer.q_norm, config.rms_norm_eps)
+        k = rms_norm(k, layer.k_norm, config.rms_norm_eps)
+        q = apply_rope(q, *rope)
+        k = apply_rope(k, *rope)
+        pool.write(layer_idx, k, v, batch.slot_mapping)
 
-    pool.write(layer_idx, k, v, batch.slot_mapping)
     out = paged_attention(q, pool, layer_idx, batch)  # [T, num_heads, head_dim]
     return F.linear(out.reshape(T, config.num_heads * config.head_dim), layer.o_proj)
 
@@ -292,10 +321,13 @@ def forward(weights: Weights, config: ModelConfig, batch: Batch, pool: KVPool) -
     the two across sequences.
     """
     x = weights.embed[batch.input_ids]  # [T, hidden]
-    cos, sin = rope_cos_sin(batch.positions, config.head_dim, config.rope_theta, x.dtype)
+    if batch.use_kernels:  # the kernel computes the angles itself
+        rope = rope_inv_freq(config.head_dim, config.rope_theta, x.device)
+    else:
+        rope = rope_cos_sin(batch.positions, config.head_dim, config.rope_theta, x.dtype)
     for i, layer in enumerate(weights.layers):
         h = rms_norm(x, layer.input_norm, config.rms_norm_eps)
-        x = x + attention_block(h, layer, i, cos, sin, config, batch, pool)
+        x = x + attention_block(h, layer, i, rope, config, batch, pool)
         x = x + mlp_block(rms_norm(x, layer.post_attn_norm, config.rms_norm_eps), layer)
     x = x[batch.logits_idx]  # drop rows nobody samples from before the expensive part
     return compute_logits(weights, rms_norm(x, weights.final_norm, config.rms_norm_eps))
