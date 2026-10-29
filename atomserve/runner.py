@@ -13,9 +13,10 @@
 
 import torch
 
+from atomserve.block_allocator import blocks_for_tokens
 from atomserve.config import ModelConfig
 from atomserve.kv_cache import KVPool
-from atomserve.model import Batch, Weights, forward
+from atomserve.model import Batch, PrefillSpan, Weights, forward
 from atomserve.sampler import Sampler
 from atomserve.sequence import Sequence
 
@@ -43,14 +44,20 @@ class ModelRunner:
         (decode). Its block table must already cover them. A sequence gets a
         logits row only if this step reaches the end of its known tokens; a
         prompt chunk that stops short has nothing to predict yet.
+
+        Context slots for attention are expanded from block tables on the GPU,
+        so host work grows with the number of blocks, not of tokens.
         """
         bs = self.pool.block_size
         input_ids: list[int] = []
         positions: list[int] = []
         slot_mapping: list[int] = []
-        context_slots: list[int] = []
-        cu_seqlens, cu_ctxlens = [0], [0]
         logits_idx: list[int] = []
+        prefills: list[PrefillSpan] = []
+        decode_rows: list[int] = []
+        decode_tables: list[list[int]] = []
+        decode_lens: list[int] = []
+        row = 0
 
         for seq, n in zip(seqs, num_new_tokens, strict=True):
             start, end = seq.num_computed_tokens, seq.num_computed_tokens + n
@@ -61,26 +68,50 @@ class ModelRunner:
 
             input_ids.extend(seq.token_ids[start:end])
             positions.extend(range(start, end))
-            slots = [slot_of(seq.block_table, p, bs) for p in range(end)]
-            slot_mapping.extend(slots[start:])
-            context_slots.extend(slots)
-            cu_seqlens.append(cu_seqlens[-1] + n)
-            cu_ctxlens.append(cu_ctxlens[-1] + end)
+            slot_mapping.extend(slot_of(seq.block_table, p, bs) for p in range(start, end))
+            table = seq.block_table[: blocks_for_tokens(end, bs)]
+            if n == 1:
+                decode_rows.append(row)
+                decode_tables.append(table)
+                decode_lens.append(end)
+            else:
+                slots = self._expand_slots(self._to_device([table]), end)[0]
+                prefills.append(PrefillSpan(slice(row, row + n), slots))
+            row += n
             if seq.reaches_end(n):
-                logits_idx.append(cu_seqlens[-1] - 1)
+                logits_idx.append(row - 1)
 
-        def to_device(values: list[int]) -> torch.Tensor:
-            return torch.tensor(values, dtype=torch.long, device=self.device)
-
-        return Batch(
-            input_ids=to_device(input_ids),
-            positions=to_device(positions),
-            slot_mapping=to_device(slot_mapping),
-            cu_seqlens=cu_seqlens,
-            context_slots=to_device(context_slots),
-            cu_ctxlens=cu_ctxlens,
-            logits_idx=to_device(logits_idx),
+        batch = Batch(
+            input_ids=self._to_device(input_ids),
+            positions=self._to_device(positions),
+            slot_mapping=self._to_device(slot_mapping),
+            logits_idx=self._to_device(logits_idx),
+            prefills=prefills,
         )
+        if decode_rows:
+            width = max(len(t) for t in decode_tables)
+            tables = self._to_device([t + [0] * (width - len(t)) for t in decode_tables])
+            longest = max(decode_lens)
+            batch.decode_rows = self._to_device(decode_rows)
+            batch.decode_slots = self._expand_slots(tables, longest)
+            if min(decode_lens) < longest:
+                key_positions = torch.arange(longest, device=self.device)
+                batch.decode_mask = key_positions[None, :] < self._to_device(decode_lens)[:, None]
+        return batch
+
+    def _to_device(self, values: list) -> torch.Tensor:
+        return torch.tensor(values, dtype=torch.long, device=self.device)
+
+    def _expand_slots(self, block_tables: torch.Tensor, length: int) -> torch.Tensor:
+        """Pool slot of positions 0..length-1 for each row of block tables.
+
+        block_tables: [N, num_blocks]  ->  returns [N, length]
+        (the same formula as `slot_of`, vectorised; padded table entries yield
+        harmless in-range slots that the caller masks out)
+        """
+        bs = self.pool.block_size
+        p = torch.arange(length, device=self.device)
+        return block_tables[:, p // bs] * bs + p % bs
 
     @torch.inference_mode()
     def run(self, seqs: list[Sequence], num_new_tokens: list[int]) -> torch.Tensor:

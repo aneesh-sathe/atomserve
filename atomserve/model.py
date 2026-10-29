@@ -53,30 +53,44 @@ class Weights:
 
 
 @dataclass
+class PrefillSpan:
+    """One sequence with several new tokens (a prompt or prompt chunk) in a Batch."""
+
+    rows: slice  # its rows in the flat batch
+    context_slots: torch.Tensor  # [context_len] pool slot of each position 0..context_len-1
+
+
+@dataclass
 class Batch:
     """One forward pass worth of tokens from B sequences, flattened. Built by the runner.
 
-    input_ids:     [T]  new tokens of all sequences, concatenated
-    positions:     [T]  absolute position of each token (drives RoPE and the causal mask)
-    slot_mapping:  [T]  pool slot each token's K/V is written to
-    cu_seqlens:    B+1 host ints; sequence i's tokens are rows cu_seqlens[i]:cu_seqlens[i+1]
-    context_slots: [sum of context lengths]  pool slots of every token each sequence
-                   attends to (cached prefix + new tokens), sequences concatenated
-    cu_ctxlens:    B+1 host ints; sequence i's context is context_slots[cu_ctxlens[i]:...]
-    logits_idx:    [B']  rows that need a next-token prediction (a sequence's last row,
-                   once its prompt is fully processed)
+    input_ids:    [T]  new tokens of all sequences, concatenated
+    positions:    [T]  absolute position of each token (drives RoPE and the causal mask)
+    slot_mapping: [T]  pool slot each token's K/V is written to
+    logits_idx:   [B'] rows that need a next-token prediction (a sequence's last row,
+                  once its prompt is fully processed)
 
-    The offsets are host ints because attention loops over sequences in Python
-    and slices with them; reading them off the GPU would force a sync per layer.
+    For attention, the sequences are split by how many new tokens they bring:
+    prefills:     sequences with several (prompt chunks), attended one at a time;
+                  few per step, and each is a large piece of work on its own
+    decode_rows:  [Bd]    rows of the sequences with exactly one (decodes)
+    decode_slots: [Bd, L] pool slots of each decode's context, padded to the longest
+    decode_mask:  [Bd, L] True where decode_slots is a real key, False for padding;
+                  None when no padding is needed (all contexts equally long)
+                  (decode_rows/decode_slots are None when there are no decodes)
+
+    All decodes share one attention call: a step's launch cost then no longer
+    grows with the batch size.
     """
 
     input_ids: torch.Tensor
     positions: torch.Tensor
     slot_mapping: torch.Tensor
-    cu_seqlens: list[int]
-    context_slots: torch.Tensor
-    cu_ctxlens: list[int]
     logits_idx: torch.Tensor
+    prefills: list[PrefillSpan]
+    decode_rows: torch.Tensor | None = None
+    decode_slots: torch.Tensor | None = None
+    decode_mask: torch.Tensor | None = None
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -179,17 +193,46 @@ def paged_attention(q: torch.Tensor, pool: KVPool, layer_idx: int, batch: Batch)
     returns  [T, num_heads, head_dim]
 
     The one place the model looks at sequence boundaries: each sequence's
-    queries may only see its own keys. This version loops over sequences,
-    gathering each one's K/V out of its blocks into a contiguous tensor; correct
-    and obvious, and the first thing the optimization phase replaces.
+    queries may only see its own keys. K/V are gathered out of the blocks into
+    contiguous tensors, then handed to SDPA.
     """
+    if batch.decode_rows is not None:
+        Bd, L = batch.decode_slots.shape
+        k, v = pool.read(layer_idx, batch.decode_slots.view(-1))
+        k, v = k.view(Bd, L, *k.shape[1:]), v.view(Bd, L, *v.shape[1:])
+        if not batch.prefills:  # a pure decode step: every row, in order
+            return decode_attention(q, k, v, batch.decode_mask)
+        decoded = decode_attention(q.index_select(0, batch.decode_rows), k, v, batch.decode_mask)
     out = torch.empty_like(q)
-    for i in range(len(batch.cu_seqlens) - 1):
-        rows = slice(batch.cu_seqlens[i], batch.cu_seqlens[i + 1])
-        slots = batch.context_slots[batch.cu_ctxlens[i] : batch.cu_ctxlens[i + 1]]
-        k, v = pool.read(layer_idx, slots)  # [context_len, num_kv_heads, head_dim]
-        out[rows] = attention(q[rows], k, v, batch.positions[rows])
+    for span in batch.prefills:
+        k, v = pool.read(layer_idx, span.context_slots)  # [context_len, num_kv_heads, head_dim]
+        out[span.rows] = attention(q[span.rows], k, v, batch.positions[span.rows])
+    if batch.decode_rows is not None:
+        out.index_copy_(0, batch.decode_rows, decoded)
     return out
+
+
+def decode_attention(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, key_mask: torch.Tensor
+) -> torch.Tensor:
+    """One new query per sequence, for a batch of sequences, in a single SDPA call.
+
+    q:        [Bd, num_heads, head_dim]        each sequence's newest query
+    k, v:     [Bd, L, num_kv_heads, head_dim]  each sequence's keys/values, padded to L
+    key_mask: [Bd, L] or None                  False for padding; None if there is none
+    returns   [Bd, num_heads, head_dim]
+
+    A decode query is the last position, so it may see its whole context: the
+    only masking needed is for padding.
+    """
+    out = F.scaled_dot_product_attention(
+        q[:, :, None, :],  # [Bd, heads, 1, head_dim]
+        k.transpose(1, 2),  # [Bd, kv_heads, L, head_dim]
+        v.transpose(1, 2),
+        attn_mask=None if key_mask is None else key_mask[:, None, None, :],
+        enable_gqa=True,
+    )
+    return out[:, :, 0, :]
 
 
 def attention_block(
@@ -265,5 +308,14 @@ def compute_logits(weights: Weights, hidden: torch.Tensor) -> torch.Tensor:
     returns [N, vocab]   fp32 logits
 
     Returned in fp32 so sampling (softmax, top-p cumulative sums) is precise.
+
+    The vocabulary is projected in slices of LM_HEAD_SLICE rows: MPS picks a
+    slow kernel for one very wide matmul once there are more than a few rows
+    (32 rows: 7.7 ms whole vs 2.2 ms sliced, on an M4 Pro), and slicing costs
+    nothing for a single row.
     """
-    return F.linear(hidden, weights.lm_head).float()
+    slices = weights.lm_head.split(LM_HEAD_SLICE)
+    return torch.cat([F.linear(hidden, w) for w in slices], dim=-1).float()
+
+
+LM_HEAD_SLICE = 32768

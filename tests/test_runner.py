@@ -34,10 +34,25 @@ def test_prepare_flattens_a_decode_and_a_prompt_chunk(tiny_weights, tiny_config)
     assert batch.input_ids.tolist() == [6, 10, 11, 12]
     assert batch.positions.tolist() == [5, 0, 1, 2]
     assert batch.slot_mapping.tolist() == [9, 20, 21, 22]  # block 2 offset 1; block 5 offsets 0-2
-    assert batch.cu_seqlens == [0, 1, 4]
-    assert batch.context_slots.tolist() == [28, 29, 30, 31, 8, 9, 20, 21, 22]
-    assert batch.cu_ctxlens == [0, 6, 9]
     assert batch.logits_idx.tolist() == [0]  # the chunk has not reached its last token
+    # The decode: row 0, attending to positions 0-5 (blocks 7 and 2).
+    assert batch.decode_rows.tolist() == [0]
+    assert batch.decode_slots.tolist() == [[28, 29, 30, 31, 8, 9]]
+    assert batch.decode_mask is None  # one decode: nothing to pad
+    # The chunk: rows 1-3, attending to positions 0-2 (block 5).
+    [span] = batch.prefills
+    assert (span.rows.start, span.rows.stop) == (1, 4)
+    assert span.context_slots.tolist() == [20, 21, 22]
+
+
+def test_decodes_of_different_lengths_are_padded_and_masked(tiny_weights, tiny_config):
+    runner = make_runner(tiny_weights, tiny_config, num_blocks=8, block_size=4)
+    short = Sequence(0, token_ids=[1, 2], num_computed_tokens=1, block_table=[3])
+    long = Sequence(1, token_ids=list(range(6)), num_computed_tokens=5, block_table=[1, 6])
+    batch = runner.prepare([short, long], [1, 1])
+    assert batch.decode_slots.shape == (2, 6)
+    assert batch.decode_slots[1].tolist() == [4, 5, 6, 7, 24, 25]
+    assert batch.decode_mask.tolist() == [[True] * 2 + [False] * 4, [True] * 6]
 
 
 def test_prepare_rejects_a_block_table_that_is_too_short(tiny_weights, tiny_config):
