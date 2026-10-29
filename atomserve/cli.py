@@ -54,7 +54,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-num-seqs", type=int, default=32, help="most requests running at once"
     )
     parser.add_argument(
-        "--max-batched-tokens", type=int, default=2048, help="token budget of one forward pass"
+        "--max-batched-tokens",
+        type=int,
+        default=512,
+        help="token budget of one forward pass; smaller bounds the stall a long prompt "
+        "causes running streams, larger prefills a little faster (default 512)",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser

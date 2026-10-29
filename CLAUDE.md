@@ -46,10 +46,16 @@ Full spec and milestones: `~/.claude/plans/i-want-to-build-tidy-stream.md`.
   use it for engine invariants instead of the real model where possible.
 - M6 bench (bf16, 128 output tokens, HTTP streaming): aggregate 72 / 221 / 445 / 609 tok/s at
   concurrency 1 / 4 / 16 / 32; TTFT p50 23 / 61 / 171 / 250 ms.
+- M7 chunked prefill, 8 streams + one 8k-token prompt: before, short-request TTFT p99 ~4.9 s
+  (head-of-line blocking) and long TTFT 6.4 s; after, TTFT p99 ~95 ms, long TTFT 3.7 s. ITL max is
+  ~1150 ms at budget 2048 vs ~325 ms at 512, while a lone 8k prefill is only ~2% slower at 512,
+  hence the 512 default.
 - Greedy outputs of identical requests can differ under bf16 when batch composition changes
   (different matmul shapes round differently). In fp32 they are identical, so invariance tests use fp32.
-- E2E terminal tests must use `pty.fork()` (a real controlling tty) or Ctrl-C never becomes SIGINT.
-  Pause ~0.3 s after the prompt appears before typing, and never `waitpid` without a timeout.
+- E2E terminal tests need the pty as the child's *controlling* tty or Ctrl-C never becomes SIGINT.
+  Don't use `pty.fork()` inside pytest (forking a multi-threaded process can deadlock the child);
+  `tests/test_repl.py` spawns via subprocess + `TIOCSCTTY`. Pause ~0.3 s after the prompt before
+  typing, and never wait on the child without a timeout.
 - Qwen3-0.6B sometimes loops forever while thinking on trick prompts; that is the model, not the engine.
 - Importing `transformers` prints a harmless torch.distributed "Redirects" warning on macOS; the engine never imports it.
 

@@ -71,7 +71,7 @@ class EngineConfig:
     block_size: int = 16  # tokens per KV block
     num_blocks: int = 1024  # size of the KV pool, in blocks
     max_num_seqs: int = 32  # most sequences running (holding KV blocks) at once
-    max_num_batched_tokens: int = 2048  # token budget of one forward pass
+    max_num_batched_tokens: int = 512  # token budget of one forward pass (bounds a step)
     max_model_len: int = 16384  # longest sequence (prompt + output) accepted
 
     def __post_init__(self) -> None:

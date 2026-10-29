@@ -30,6 +30,13 @@ def test_preemption_under_memory_pressure_does_not_change_outputs(tiny_weights, 
     assert engine.generate(PROMPTS, GREEDY) == alone
 
 
+def test_chunked_prefill_matches_whole_prompt_prefill(tiny_weights, tiny_config):
+    """With a 4-token budget every prompt is split into chunks; the outputs don't change."""
+    alone = [tiny_engine(tiny_weights, tiny_config).generate([p], GREEDY)[0] for p in PROMPTS]
+    engine = tiny_engine(tiny_weights, tiny_config, max_num_batched_tokens=4, max_num_seqs=4)
+    assert engine.generate(PROMPTS, GREEDY) == alone
+
+
 def test_engine_thread_serves_concurrent_clients(tiny_weights, tiny_config):
     """Requests submitted from several threads stream back the same tokens as alone."""
     alone = [tiny_engine(tiny_weights, tiny_config).generate([p], GREEDY)[0] for p in PROMPTS]
@@ -82,6 +89,15 @@ PROMPTS_REAL = [
     [9707, 11, 847, 829, 374],  # "Hello, my name is"
     [16, 11, 220, 17, 11, 220, 18, 11],  # "1, 2, 3,"
 ]
+
+
+@pytest.mark.slow
+def test_chunked_prefill_matches_on_real_model(weights_fp32, config, greedy):
+    """A ~500-token prompt prefilled in 64-token chunks gives the same greedy tokens."""
+    prompt = (PROMPTS_REAL[0] + PROMPTS_REAL[1]) * 50
+    [whole] = greedy(weights_fp32, config, [prompt], 16)
+    [chunked] = greedy(weights_fp32, config, [prompt], 16, max_num_batched_tokens=64)
+    assert chunked == whole
 
 
 @pytest.mark.slow

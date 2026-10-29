@@ -127,9 +127,31 @@ def test_admission_respects_the_token_budget():
     assert len(scheduler.waiting) == 1
 
 
-def test_a_prompt_larger_than_the_budget_runs_alone():
-    outputs, _, _ = run([[1] * 20, [2, 3]], max_num_batched_tokens=8, max_num_seqs=4)
-    assert outputs == [alone([1] * 20), alone([2, 3])]
+def test_long_prompt_is_prefilled_in_chunks_alongside_decodes():
+    """A 20-token prompt with an 8-token budget runs as chunks of 7, 7, 6 (one budget
+    token goes to the running decode each step), and the decode never misses a step."""
+    cfg = EngineConfig(
+        block_size=4, num_blocks=64, max_model_len=64, max_num_batched_tokens=8, max_num_seqs=4
+    )
+    scheduler, runner = Scheduler(cfg, frozenset()), FakeRunner(4)
+    short, long = Sequence(0, [2, 3], GREEDY), Sequence(1, [1] * 20, GREEDY)
+    scheduler.add(short)
+    out = scheduler.schedule()
+    scheduler.update(out, runner.execute(out.seqs, out.num_new_tokens))
+    scheduler.add(long)
+    plans = []
+    while long.num_computed_tokens < long.num_prompt_tokens:
+        out = scheduler.schedule()
+        plans.append(list(zip(out.seqs, out.num_new_tokens, strict=True)))
+        scheduler.update(out, runner.execute(out.seqs, out.num_new_tokens))
+    assert plans == [[(short, 1), (long, 7)], [(short, 1), (long, 7)], [(short, 1), (long, 6)]]
+    assert len(long.output_ids) == 1  # sampled only once its last chunk ran
+
+
+def test_chunked_prefill_does_not_change_outputs():
+    prompts = [[1] * 20, [2, 3], list(range(30, 47))]
+    outputs, _, _ = run(prompts, max_num_batched_tokens=8, max_num_seqs=4)
+    assert outputs == [alone(p) for p in prompts]
 
 
 def test_finish_reasons_and_eos():

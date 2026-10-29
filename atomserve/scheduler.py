@@ -7,13 +7,20 @@
 #
 # Each step, under two limits (max_num_seqs sequences, max_num_batched_tokens
 # tokens per forward pass):
-#   1. Running sequences go first, one decode token each, oldest first. If the
-#      pool has no block for one, the most recently admitted sequence is
-#      *preempted*: its blocks are freed and it goes back to the front of the
-#      queue, to be recomputed from its tokens later. Recomputing is cheaper
-#      than it sounds (prefill is fast) and needs no swap space.
+#   1. Running sequences go first, oldest first: one token for a decode, or the
+#      next chunk of a prompt still being prefilled. If the pool has no block
+#      for one, the most recently admitted sequence is *preempted*: its blocks
+#      are freed and it goes back to the front of the queue, to be recomputed
+#      from its tokens later. Recomputing is cheaper than it sounds (prefill is
+#      fast) and needs no swap space.
 #   2. Waiting sequences are admitted first come, first served, while the
 #      token budget, the sequence limit and free blocks allow.
+#
+# Chunked prefill: a prompt never has to fit the budget in one piece. It takes
+# whatever budget is left this step and continues next step. So a long prompt
+# neither waits for an empty step (blocking everyone queued behind it) nor
+# hogs one giant step: every step stays bounded by the budget, which bounds
+# how long running streams wait for their next token.
 #
 # It only does bookkeeping on Sequence objects and block ids, plain Python
 # with no torch, so every policy decision is testable without a GPU.
@@ -30,8 +37,8 @@ from atomserve.sequence import Sequence, SequenceStatus
 class SchedulerOutput:
     """The plan for one engine step.
 
-    seqs[i] runs its next num_new_tokens[i] tokens: its whole prompt (prefill)
-    or its newest token (decode). `preempted` lists sequences evicted to make
+    seqs[i] runs its next num_new_tokens[i] tokens: its whole prompt, a chunk
+    of it (prefill), or its newest token (decode). `preempted` lists sequences evicted to make
     room this step; they are waiting again, not part of this step.
     """
 
@@ -72,7 +79,9 @@ class Scheduler:
         for seq in list(self.running):
             if seq.status is not SequenceStatus.RUNNING:
                 continue  # preempted earlier in this loop to make room
-            n = seq.num_tokens - seq.num_computed_tokens
+            n = min(seq.num_tokens - seq.num_computed_tokens, budget)
+            if n == 0:
+                continue  # budget spent; it simply waits for the next step
             while not self._reserve(seq, n):
                 victim = self.running[-1]  # newest first: it has the least work to redo
                 self._preempt(victim)
@@ -88,9 +97,8 @@ class Scheduler:
         #    and admitting would just evict someone again next step.
         while self.waiting and not out.preempted and len(self.running) < self.config.max_num_seqs:
             seq = self.waiting[0]
-            n = seq.num_tokens - seq.num_computed_tokens  # whole prompt (or recompute)
-            # A prompt larger than the whole budget may only run on an empty step.
-            if (n > budget and out.seqs) or not self._reserve(seq, n):
+            n = min(seq.num_tokens - seq.num_computed_tokens, budget)  # prompt, or a chunk
+            if n == 0 or not self._reserve(seq, n):
                 break
             self.waiting.popleft()
             seq.status = SequenceStatus.RUNNING
