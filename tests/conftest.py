@@ -59,15 +59,12 @@ def tiny_weights() -> Weights:
     layers = [
         LayerWeights(
             input_norm=norm(c.hidden_size),
-            q_proj=rand(q_dim, c.hidden_size),
-            k_proj=rand(kv_dim, c.hidden_size),
-            v_proj=rand(kv_dim, c.hidden_size),
+            qkv_proj=rand(q_dim + 2 * kv_dim, c.hidden_size),
             q_norm=norm(c.head_dim),
             k_norm=norm(c.head_dim),
             o_proj=rand(c.hidden_size, q_dim),
             post_attn_norm=norm(c.hidden_size),
-            gate_proj=rand(c.intermediate_size, c.hidden_size),
-            up_proj=rand(c.intermediate_size, c.hidden_size),
+            gate_up_proj=rand(2 * c.intermediate_size, c.hidden_size),
             down_proj=rand(c.hidden_size, c.intermediate_size),
         )
         for _ in range(c.num_layers)

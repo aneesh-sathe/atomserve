@@ -28,17 +28,18 @@ from atomserve.kv_cache import KVPool
 class LayerWeights:
     """Parameters of one decoder layer. Shapes shown for Qwen3-0.6B."""
 
-    input_norm: torch.Tensor  # [1024]         RMSNorm before attention
-    q_proj: torch.Tensor  # [16*128, 1024]     hidden -> all query heads
-    k_proj: torch.Tensor  # [8*128, 1024]      hidden -> all key heads
-    v_proj: torch.Tensor  # [8*128, 1024]      hidden -> all value heads
-    q_norm: torch.Tensor  # [128]              RMSNorm applied to each query head
-    k_norm: torch.Tensor  # [128]              RMSNorm applied to each key head
-    o_proj: torch.Tensor  # [1024, 16*128]     concatenated heads -> hidden
-    post_attn_norm: torch.Tensor  # [1024]     RMSNorm before the MLP
-    gate_proj: torch.Tensor  # [3072, 1024]    SwiGLU gate branch
-    up_proj: torch.Tensor  # [3072, 1024]      SwiGLU value branch
-    down_proj: torch.Tensor  # [1024, 3072]    back to hidden size
+    input_norm: torch.Tensor  # [1024]                 RMSNorm before attention
+    qkv_proj: torch.Tensor  # [(16+8+8)*128, 1024]     hidden -> all q, k and v heads
+    q_norm: torch.Tensor  # [128]                      RMSNorm applied to each query head
+    k_norm: torch.Tensor  # [128]                      RMSNorm applied to each key head
+    o_proj: torch.Tensor  # [1024, 16*128]             concatenated heads -> hidden
+    post_attn_norm: torch.Tensor  # [1024]             RMSNorm before the MLP
+    gate_up_proj: torch.Tensor  # [2*3072, 1024]       SwiGLU gate and value branches
+    down_proj: torch.Tensor  # [1024, 3072]            back to hidden size
+
+    # The checkpoint stores q/k/v (and gate/up) as separate matrices; the loader
+    # stacks them so each is one matmul. Same math, fewer kernel launches: at
+    # decode, every launch has a fixed cost comparable to the matmul itself.
 
 
 @dataclass
@@ -85,15 +86,14 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     weight: [D]   learned per-channel scale
     returns [..., D] in x's dtype
 
-    Rescales each vector to unit RMS, then applies the learned scale. Unlike
-    LayerNorm there is no mean subtraction and no bias. The reduction runs in
-    fp32 because summing squares in bf16 loses precision; the result is cast back
-    *before* multiplying by the weight, matching the reference implementation.
+    Computes  weight * x / sqrt(mean(x^2) + eps): rescale each vector to unit RMS,
+    then apply the learned scale. Unlike LayerNorm there is no mean subtraction
+    and no bias. PyTorch's fused kernel does this in one launch (accumulating in
+    fp32) where the longhand version takes eight; in bf16 it can differ from the
+    reference by one rounding step, since the reference rounds before the weight
+    multiply as well as after.
     """
-    input_dtype = x.dtype
-    x32 = x.float()
-    x32 = x32 * torch.rsqrt(x32.pow(2).mean(dim=-1, keepdim=True) + eps)
-    return weight * x32.to(input_dtype)
+    return F.rms_norm(x, (x.shape[-1],), weight, eps)
 
 
 def rope_cos_sin(
@@ -212,10 +212,9 @@ def attention_block(
     hidden size with o_proj. Writing before attending means each new token sees
     its own key, and past tokens are never re-projected.
     """
-    T = x.shape[0]
-    q = F.linear(x, layer.q_proj).view(T, config.num_heads, config.head_dim)
-    k = F.linear(x, layer.k_proj).view(T, config.num_kv_heads, config.head_dim)
-    v = F.linear(x, layer.v_proj).view(T, config.num_kv_heads, config.head_dim)
+    T, H, KV = x.shape[0], config.num_heads, config.num_kv_heads
+    qkv = F.linear(x, layer.qkv_proj).view(T, H + 2 * KV, config.head_dim)
+    q, k, v = qkv.split([H, KV, KV], dim=1)
 
     q = rms_norm(q, layer.q_norm, config.rms_norm_eps)
     k = rms_norm(k, layer.k_norm, config.rms_norm_eps)
@@ -235,9 +234,8 @@ def mlp_block(x: torch.Tensor, layer: LayerWeights) -> torch.Tensor:
     The gate branch, passed through SiLU, decides per channel how much of the up
     branch to let through. Applied to every token independently.
     """
-    return F.linear(
-        F.silu(F.linear(x, layer.gate_proj)) * F.linear(x, layer.up_proj), layer.down_proj
-    )
+    gate, up = F.linear(x, layer.gate_up_proj).chunk(2, dim=-1)
+    return F.linear(F.silu(gate) * up, layer.down_proj)
 
 
 def forward(weights: Weights, config: ModelConfig, batch: Batch, pool: KVPool) -> torch.Tensor:

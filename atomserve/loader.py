@@ -44,7 +44,8 @@ def load_weights(
     """Read every `*.safetensors` shard and build `Weights` on `device` in `dtype`.
 
     Checkpoint names look like `model.layers.3.self_attn.q_proj.weight`; this is
-    the only place that knows them. Tensors are loaded on CPU, then cast and moved
+    the only place that knows them. q/k/v and gate/up are stacked here into one
+    matrix each. Tensors are loaded on CPU, then cast and moved
     one at a time so peak memory stays near one model's worth.
     """
     raw: dict[str, torch.Tensor] = {}
@@ -56,21 +57,26 @@ def load_weights(
     def take(name: str) -> torch.Tensor:
         return raw.pop(name).to(device=device, dtype=dtype)
 
+    def stack(*names: str) -> torch.Tensor:
+        """Concatenate projection matrices along their output rows (see LayerWeights)."""
+        return torch.cat([raw.pop(n) for n in names]).to(device=device, dtype=dtype)
+
     layers = []
     for i in range(config.num_layers):
         p = f"model.layers.{i}."
         layers.append(
             LayerWeights(
                 input_norm=take(p + "input_layernorm.weight"),
-                q_proj=take(p + "self_attn.q_proj.weight"),
-                k_proj=take(p + "self_attn.k_proj.weight"),
-                v_proj=take(p + "self_attn.v_proj.weight"),
+                qkv_proj=stack(
+                    p + "self_attn.q_proj.weight",
+                    p + "self_attn.k_proj.weight",
+                    p + "self_attn.v_proj.weight",
+                ),
                 q_norm=take(p + "self_attn.q_norm.weight"),
                 k_norm=take(p + "self_attn.k_norm.weight"),
                 o_proj=take(p + "self_attn.o_proj.weight"),
                 post_attn_norm=take(p + "post_attention_layernorm.weight"),
-                gate_proj=take(p + "mlp.gate_proj.weight"),
-                up_proj=take(p + "mlp.up_proj.weight"),
+                gate_up_proj=stack(p + "mlp.gate_proj.weight", p + "mlp.up_proj.weight"),
                 down_proj=take(p + "mlp.down_proj.weight"),
             )
         )
