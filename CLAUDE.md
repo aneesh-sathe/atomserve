@@ -11,10 +11,11 @@ Full spec and milestones: `~/.claude/plans/i-want-to-build-tidy-stream.md`.
 - Code is the doc: every file has a header comment on its concept; every function a docstring with
   purpose, tensor shapes and the non-obvious "why". No separate design docs; README is install + usage.
 - Built milestone by milestone (M0-M8); the user reviews each before the next starts.
-- M4 was built before M3 at the user's request; M3 (tokenizer, sampler, REPL) is still pending.
+- M4 was built before M3 at the user's request.
 - `block_allocator.py` is separate from `kv_cache.py` (plan had them together) so the scheduler
   stays pure Python: the allocator tracks block ids, `KVPool` only holds tensors.
-- The runner never mutates a `Sequence`; the driver (generate.py now, scheduler from M5) does.
+- The runner never mutates a `Sequence`; only the scheduler does (on the engine thread).
+- Engine deals in token ids only; detokenization and stop strings live in the clients (REPL, server).
 
 ## Commands
 - `uv sync` - install (Python 3.14 pinned in `.python-version`; torch ships cp314 macOS wheels)
@@ -22,7 +23,7 @@ Full spec and milestones: `~/.claude/plans/i-want-to-build-tidy-stream.md`.
 - `uv run pytest` - fast tests (default excludes `slow`)
 - `uv run pytest -m slow` - tests needing model weights / GPU
 
-- `uv run python -m atomserve.generate Qwen/Qwen3-0.6B "prompt"` - greedy demo (temporary until the engine lands)
+- `uv run atomserve Qwen/Qwen3-0.6B` - chat REPL (`/help` inside)
 
 ## Pitfalls / verified facts
 - Qwen3-0.6B ships `lm_head.weight` even though `tie_word_embeddings=true`; follow the config (use the embedding).
@@ -41,6 +42,9 @@ Full spec and milestones: `~/.claude/plans/i-want-to-build-tidy-stream.md`.
 - `tensor.view(-1, ...)` of a pool layer + `index_copy_` / `index_select` scatter/gather slots correctly on MPS.
 - Fast tests run the full paged model on a tiny random-weight config on CPU (`tiny_weights` fixture);
   use it for engine invariants instead of the real model where possible.
+- E2E terminal tests must use `pty.fork()` (a real controlling tty) or Ctrl-C never becomes SIGINT.
+  Pause ~0.3 s after the prompt appears before typing, and never `waitpid` without a timeout.
+- Qwen3-0.6B sometimes loops forever while thinking on trick prompts; that is the model, not the engine.
 - Importing `transformers` prints a harmless torch.distributed "Redirects" warning on macOS; the engine never imports it.
 
 ## Conventions
