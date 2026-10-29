@@ -92,3 +92,40 @@ def test_engine_outputs_match_with_kernels_on_and_off():
     params = SamplingParams(temperature=0.0, max_tokens=12, ignore_eos=True)
     with_kernels = engine(weights, use_kernels=True).generate(prompts, params)
     assert with_kernels == engine(weights, use_kernels=False).generate(prompts, params)
+
+
+def test_topk_rows_matches_torch_topk():
+    """Exact values (and tokens with those values) for every k, including ties and
+    rows with fewer finite entries than k."""
+    torch.manual_seed(0)
+    rows = [
+        torch.randn(7, 151936, device=MPS) * 4,
+        torch.randint(-5, 5, (3, 151936), device=MPS).float(),  # heavy ties
+        torch.full((2, 151936), float("-inf"), device=MPS).index_fill_(
+            1, torch.tensor([3, 9], device=MPS), 1.0
+        ),
+    ]
+    for x in rows:
+        for k in (1, 2, 20, 33, 64):
+            values, indices = kernels.topk_rows(x, k)
+            expected = x.topk(k, dim=-1).values
+            assert torch.equal(values, expected)
+            assert torch.equal(x.gather(1, indices), expected)
+
+
+def test_sampler_is_the_same_with_and_without_the_topk_kernel():
+    from atomserve.sampler import Sampler
+    from atomserve.sequence import Sequence
+
+    logits = torch.randn(6, 151936, device=MPS) * 3
+    params = [
+        SamplingParams(temperature=0.0),
+        SamplingParams(temperature=0.7, top_k=20, top_p=0.8, seed=1),
+        SamplingParams(temperature=1.0, top_k=64, top_p=1.0, seed=2),
+        SamplingParams(temperature=0.6, top_k=5, top_p=0.95, seed=3),
+        SamplingParams(temperature=1.3, top_k=1, seed=4),
+        SamplingParams(temperature=0.0, presence_penalty=2.0),
+    ]
+    seqs = [Sequence(i, [0, 7, 7, 9], p, num_prompt_tokens=1) for i, p in enumerate(params)]
+    with_kernel = Sampler(MPS, use_kernels=True).sample(logits, seqs)
+    assert with_kernel == Sampler(MPS, use_kernels=False).sample(logits, seqs)

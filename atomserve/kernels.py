@@ -10,6 +10,8 @@
 #   paged_decode_attention   attention for single-query sequences that reads
 #                            K/V straight from the paged pool through the block
 #                            tables: no gather copy, two launches for the batch
+#   topk_rows                the sampler's top-k over the 151,936-entry vocabulary,
+#                            several times faster than torch.topk on MPS
 #
 # model.py keeps the plain-PyTorch versions of the same math (the readable
 # reference, also used on CPU); tests check that both agree. The kernels
@@ -220,6 +222,107 @@ kernel void decode_attention_reduce(
     out[row * 32 + t] = vec<T, 4>(a / l_all);
 }
 
+// Merge step shared by topk_rows: each lane offers the head of its own sorted
+// list (values[lane][*] in threadgroup memory, `len` entries each); k rounds of
+// simd_max pick the k largest overall, in order. Inside one simdgroup, so no
+// barriers. Ties go to the lowest lane.
+template <typename Emit>
+inline void simd_merge(threadgroup float (*values)[64], uint lanes, uint len, uint K,
+                       uint lane, Emit emit) {
+    uint h = 0;
+    for (uint n = 0; n < K; ++n) {
+        const float mine = lane < lanes && h < len ? values[lane][h] : -INFINITY;
+        const float best = simd_max(mine);
+        if (lane == simd_min(mine == best ? lane : 32u)) {
+            emit(n, mine, lane, h);
+            ++h;
+        }
+    }
+}
+
+// Top-k of each row of a [B, V] matrix, sorted, for k <= 64 (the sampler's top-k).
+// One threadgroup of 1024 threads per row:
+//   1. a threshold: each thread takes the max of its strided share of the row;
+//      tau = the k-th largest of those 1024 maxima. Those k maxima are k distinct
+//      entries >= tau, so the row's whole top k is >= tau.
+//   2. each thread rescans its share keeping a sorted list of its entries >= tau;
+//      thanks to the threshold, almost every entry is skipped by one comparison.
+//   3. each simdgroup merges its lanes' lists, then simdgroup 0 merges those.
+kernel void topk_rows(
+    device float* out_values  [[buffer(0)]],   // [B, k]
+    device long* out_indices  [[buffer(1)]],   // [B, k]
+    constant float* x         [[buffer(2)]],   // [B, V]
+    constant long& V          [[buffer(3)]],
+    constant long& k          [[buffer(4)]],
+    uint row      [[threadgroup_position_in_grid]],
+    uint tid      [[thread_index_in_threadgroup]],
+    uint nthreads [[threads_per_threadgroup]],
+    uint sg       [[simdgroup_index_in_threadgroup]],
+    uint nsg      [[simdgroups_per_threadgroup]],
+    uint lane     [[thread_index_in_simdgroup]])
+{
+    constexpr uint MAX_K = 64;
+    const uint K = k;
+    constant float* r = x + row * V;
+    threadgroup float sg_vals[32][MAX_K];
+    threadgroup uint sg_idxs[32][MAX_K];
+    threadgroup float tau;
+
+    // 1. The threshold: per-simdgroup top k of the lanes' maxima (a lane's max is
+    //    taken once, then replaced by -inf), then the k-th largest across simdgroups.
+    float m = -INFINITY;
+    for (uint i = tid; i < V; i += nthreads) m = max(m, r[i]);
+    for (uint n = 0; n < K; ++n) {
+        const float best = simd_max(m);
+        if (lane == simd_min(m == best ? lane : 32u)) {
+            sg_vals[sg][n] = m;
+            m = -INFINITY;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0)
+        simd_merge(sg_vals, nsg, K, K, lane, [&](uint n, float v, uint, uint) {
+            if (n == K - 1) tau = v;  // -inf if the row has fewer than k finite entries
+        });
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float threshold = tau;
+
+    // 2. Sorted local lists of the entries >= threshold.
+    float vals[MAX_K];
+    uint idxs[MAX_K];
+    uint count = 0;
+    for (uint i = tid; i < V; i += nthreads) {
+        const float v = r[i];
+        if (v < threshold || (count == K && v <= vals[K - 1])) continue;
+        uint pos = count < K ? count++ : K - 1;
+        while (pos > 0 && vals[pos - 1] < v) {  // insertion into the descending list
+            vals[pos] = vals[pos - 1];
+            idxs[pos] = idxs[pos - 1];
+            --pos;
+        }
+        vals[pos] = v;
+        idxs[pos] = i;
+    }
+
+    // 3. Merge: lanes -> simdgroups (via each lane's own registers) -> simdgroup 0.
+    uint head = 0;
+    for (uint n = 0; n < K; ++n) {
+        const float mine = head < count ? vals[head] : -INFINITY;
+        const float best = simd_max(mine);
+        if (lane == simd_min(mine == best ? lane : 32u)) {
+            sg_vals[sg][n] = mine;
+            sg_idxs[sg][n] = head < count ? idxs[head] : 0;
+            head += head < count;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg != 0) return;
+    simd_merge(sg_vals, nsg, K, K, lane, [&](uint n, float v, uint s, uint h) {
+        out_values[row * K + n] = v;
+        out_indices[row * K + n] = h < K ? sg_idxs[s][h] : 0;
+    });
+}
+
 #define INSTANTIATE_PARTIAL(T, NAME, G)                                                   \
 template [[host_name("decode_attention_partial_" NAME "_g" #G)]] kernel void              \
 decode_attention_partial<T, G>(device float*, device float*, device float4*,              \
@@ -339,3 +442,20 @@ def paged_decode_attention(
             out, part_m, part_l, part_acc, partitions, threads=(32 * H, B), group_size=(32, 1)
         )
     return out
+
+
+TOPK_MAX = 64
+
+
+def topk_rows(x: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """The k largest entries of each row, sorted descending, for k <= TOPK_MAX.
+
+    x: [B, V] fp32  ->  (values [B, k] fp32, indices [B, k] int64)
+
+    Same result as torch.topk(x, k) (ties may be ordered differently).
+    """
+    B, V = x.shape
+    values = torch.empty(B, k, device=x.device, dtype=torch.float32)
+    indices = torch.empty(B, k, device=x.device, dtype=torch.long)
+    _lib().topk_rows(values, indices, x.contiguous(), V, k, threads=1024 * B, group_size=1024)
+    return values, indices

@@ -4,7 +4,11 @@
 # another temperature 0.7 with top-p 0.8), so each setting becomes a per-row
 # tensor and the steps run as batched tensor ops instead of a Python loop:
 #
-#     logits -> presence penalty -> / temperature -> top-k -> softmax -> top-p -> draw
+#     logits -> presence penalty -> top-k -> / temperature -> softmax -> top-p -> draw
+#
+# Top-k runs first, on the raw logits: dividing by a positive temperature
+# doesn't change which tokens are largest, and afterwards only k values per
+# row are left to work on instead of 151,936. A greedy row is just its top 1.
 #
 # The draw is an "exponential race": argmax(p_i / E_i) with E_i ~ Exp(1)
 # picks token i with probability exactly p_i / sum(p). It needs no
@@ -13,14 +17,17 @@
 
 import torch
 
+from atomserve import kernels
 from atomserve.sequence import Sequence
 
 
 class Sampler:
     """Batched sampling, plus the per-request random generators of seeded requests."""
 
-    def __init__(self, device: torch.device):
+    def __init__(self, device: torch.device, use_kernels: bool = False):
+        """use_kernels: take the top-k with the Metal kernel (kernels.topk_rows)."""
         self.device = device
+        self.use_kernels = use_kernels
         self._generators: dict[int, torch.Generator] = {}
 
     def release(self, seq_id: int) -> None:
@@ -35,38 +42,51 @@ class Sampler:
             self._generators[seq.id] = g
         return self._generators[seq.id]
 
+    def top_k(self, logits: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Each row's k largest logits and their token ids, best first: ([B, k], [B, k])."""
+        if self.use_kernels and k <= kernels.TOPK_MAX:
+            return kernels.topk_rows(logits, k)
+        return logits.topk(k, dim=-1)
+
     def sample(self, logits: torch.Tensor, seqs: list[Sequence]) -> list[int]:
         """Choose one next token per row.
 
         logits: [B, vocab] fp32, row i belongs to seqs[i]
         returns B token ids (one host sync, here, per engine step)
         """
-        B, vocab = logits.shape
+        if not seqs:  # a step that only advanced prompt chunks
+            return []
+        vocab = logits.shape[1]
         params = [s.params for s in seqs]
         logits = apply_presence_penalty(logits, seqs)
-        greedy = logits.argmax(dim=-1)
-        if all(p.temperature == 0 for p in params):
-            return greedy.tolist()
-
-        def per_row(values: list[float]) -> torch.Tensor:
-            return torch.tensor(values, device=logits.device, dtype=torch.float32)
-
-        temperature = per_row([p.temperature if p.temperature > 0 else 1.0 for p in params])
-        logits = logits / temperature[:, None]
-
-        # Top-k: keep each row's k best (sorted, best first). Taking the widest k
-        # in the batch once and masking per row avoids sorting all 151,936 entries.
-        ks = [p.top_k if 0 < p.top_k < vocab else vocab for p in params]
+        # Candidates per row: its top_k (0 means all), and just 1 for a greedy row.
+        ks = [
+            1 if p.temperature == 0 else p.top_k if 0 < p.top_k < vocab else vocab for p in params
+        ]
         width = max(ks)
-        values, indices = logits.topk(width, dim=-1)  # [B, width]
+        values, indices = self.top_k(logits, width)  # [B, width], sorted, best first
+        if width == 1:  # the whole batch is greedy
+            return indices[:, 0].tolist()
+
+        # Per-row settings, in one host-to-device copy.
+        settings = torch.tensor(
+            [
+                [p.temperature if p.temperature > 0 else 1.0 for p in params],
+                [p.top_p for p in params],
+                ks,
+                [p.temperature == 0 for p in params],
+            ],
+            device=logits.device,
+            dtype=torch.float32,
+        )
+        temperature, top_p, k, is_greedy = settings
         rank = torch.arange(width, device=logits.device)
-        values = values.masked_fill(rank[None, :] >= per_row(ks)[:, None], float("-inf"))
+        values = (values / temperature[:, None]).masked_fill(rank >= k[:, None], float("-inf"))
         probs = values.softmax(dim=-1)
 
         # Top-p (nucleus): drop a token once the mass of the tokens ranked above it
         # already reaches p. The best token always survives.
         mass_before = probs.cumsum(dim=-1) - probs
-        top_p = per_row([p.top_p for p in params])
         probs = probs.masked_fill(mass_before >= top_p[:, None], 0.0)
 
         noise = torch.empty_like(probs).exponential_()
@@ -76,9 +96,7 @@ class Sampler:
                 noise[i, : ks[i]].exponential_(generator=self._generator(seq))
         choice = (probs / noise.clamp_min(1e-10)).argmax(dim=-1)  # clamp: no 0/0 = NaN
         sampled = indices.gather(1, choice[:, None]).squeeze(1)
-
-        is_greedy = torch.tensor([p.temperature == 0 for p in params], device=logits.device)
-        return torch.where(is_greedy, greedy, sampled).tolist()
+        return torch.where(is_greedy.bool(), indices[:, 0], sampled).tolist()
 
 
 def apply_presence_penalty(logits: torch.Tensor, seqs: list[Sequence]) -> torch.Tensor:

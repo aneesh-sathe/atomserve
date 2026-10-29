@@ -38,10 +38,10 @@ class ModelRunner:
         self.config = config
         self.pool = pool
         self.device = weights.embed.device
-        self.sampler = Sampler(self.device)
         if use_kernels is None:
             use_kernels = kernels.available(self.device, weights.embed.dtype, config)
         self.use_kernels = use_kernels
+        self.sampler = Sampler(self.device, use_kernels=use_kernels)
 
     def prepare(self, seqs: list[Sequence], num_new_tokens: list[int]) -> Batch:
         """Flatten one step's work into a Batch.

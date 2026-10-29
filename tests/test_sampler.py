@@ -76,3 +76,8 @@ def test_greedy_and_sampled_rows_mix_in_one_batch(seed):
     batch = seqs(1, temperature=0.0) + seqs(1, temperature=1.0, top_k=1, seed=seed)
     batch[1].id = 1
     assert Sampler(CPU).sample(logits, batch) == [1, 2]
+
+
+def test_a_step_with_nothing_to_sample():
+    """A step that only advanced prompt chunks hands the sampler zero rows."""
+    assert Sampler(CPU).sample(torch.empty(0, 10), []) == []
