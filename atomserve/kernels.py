@@ -12,6 +12,7 @@
 #                            tables: no gather copy, two launches for the batch
 #   topk_rows                the sampler's top-k over the 151,936-entry vocabulary,
 #                            several times faster than torch.topk on MPS
+#   silu_mul                 SwiGLU's silu(gate) * up in one pass
 #
 # model.py keeps the plain-PyTorch versions of the same math (the readable
 # reference, also used on CPU); tests check that both agree. The kernels
@@ -323,6 +324,20 @@ kernel void topk_rows(
     });
 }
 
+// SwiGLU's gating, fused: out = silu(gate) * up, reading the stacked [T, 2I]
+// output of the gate_up projection directly (two launches and a temporary -> one).
+template <typename T>
+kernel void silu_mul(
+    device T* out         [[buffer(0)]],   // [T, I]
+    constant T* gate_up   [[buffer(1)]],   // [T, 2I]: gate in the first half, up in the second
+    constant long& inner  [[buffer(2)]],   // I
+    uint2 pos [[thread_position_in_grid]])  // (column, token)
+{
+    const ulong i = pos.x, t = pos.y, I = inner;
+    const float g = float(gate_up[t * 2 * I + i]), u = float(gate_up[t * 2 * I + I + i]);
+    out[t * I + i] = T(g / (1.0f + exp(-g)) * u);
+}
+
 #define INSTANTIATE_PARTIAL(T, NAME, G)                                                   \
 template [[host_name("decode_attention_partial_" NAME "_g" #G)]] kernel void              \
 decode_attention_partial<T, G>(device float*, device float*, device float4*,              \
@@ -334,6 +349,8 @@ template [[host_name("qk_norm_rope_store_" NAME)]] kernel void qk_norm_rope_stor
     device T*, device T*, device T*, constant T*, constant T*, constant T*,               \
     constant long*, constant long*, constant float*, constant long&, constant long&,      \
     constant float&, uint2, uint2, uint, uint);                                           \
+template [[host_name("silu_mul_" NAME)]] kernel void silu_mul<T>(                          \
+    device T*, constant T*, constant long&, uint2);                                       \
 template [[host_name("decode_attention_reduce_" NAME)]] kernel void                       \
 decode_attention_reduce<T>(device vec<T, 4>*, constant float*, constant float*,           \
     constant float4*, constant long&, uint2, uint2, uint);                                \
@@ -459,3 +476,16 @@ def topk_rows(x: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
     indices = torch.empty(B, k, device=x.device, dtype=torch.long)
     _lib().topk_rows(values, indices, x.contiguous(), V, k, threads=1024 * B, group_size=1024)
     return values, indices
+
+
+def silu_mul(gate_up: torch.Tensor) -> torch.Tensor:
+    """silu(gate) * up for the stacked gate_up projection output.
+
+    gate_up: [T, 2I]  ->  returns [T, I]
+    """
+    T, two_i = gate_up.shape
+    out = torch.empty(T, two_i // 2, device=gate_up.device, dtype=gate_up.dtype)
+    getattr(_lib(), "silu_mul_" + _SUFFIX[gate_up.dtype])(
+        out, gate_up.contiguous(), two_i // 2, threads=(two_i // 2, T), group_size=(256, 1)
+    )
+    return out

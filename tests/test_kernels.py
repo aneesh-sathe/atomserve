@@ -129,3 +129,12 @@ def test_sampler_is_the_same_with_and_without_the_topk_kernel():
     seqs = [Sequence(i, [0, 7, 7, 9], p, num_prompt_tokens=1) for i, p in enumerate(params)]
     with_kernel = Sampler(MPS, use_kernels=True).sample(logits, seqs)
     assert with_kernel == Sampler(MPS, use_kernels=False).sample(logits, seqs)
+
+
+def test_silu_mul_matches_pytorch():
+    for rows in (1, 7, 300):
+        gate_up = torch.randn(rows, 2 * 3072, device=MPS) * 3
+        gate, up = gate_up.chunk(2, dim=-1)
+        assert torch.allclose(
+            kernels.silu_mul(gate_up), torch.nn.functional.silu(gate) * up, atol=1e-5
+        )

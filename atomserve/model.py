@@ -302,7 +302,9 @@ def attention_block(
     return torch.addmm(residual, out.reshape(T, H * config.head_dim), layer.o_proj.t())
 
 
-def mlp_block(x: torch.Tensor, residual: torch.Tensor, layer: LayerWeights) -> torch.Tensor:
+def mlp_block(
+    x: torch.Tensor, residual: torch.Tensor, layer: LayerWeights, use_kernels: bool = False
+) -> torch.Tensor:
     """SwiGLU feed-forward network: residual + down( silu(gate(x)) * up(x) ).
 
     x:        [T, hidden]  the input after the layer's second RMSNorm
@@ -313,10 +315,15 @@ def mlp_block(x: torch.Tensor, residual: torch.Tensor, layer: LayerWeights) -> t
     branch to let through. Applied to every token independently. The residual
     add is fused into the down projection: addmm(residual, a, W^T) is one kernel
     where `residual + a @ W^T` is two, and at decode a launch costs about as
-    much as the add itself.
+    much as the add itself. With use_kernels, silu(gate) * up is one Metal kernel.
     """
-    gate, up = F.linear(x, layer.gate_up_proj).chunk(2, dim=-1)
-    return torch.addmm(residual, F.silu(gate) * up, layer.down_proj.t())
+    gate_up = F.linear(x, layer.gate_up_proj)  # [T, 2 * intermediate]
+    if use_kernels:
+        hidden = kernels.silu_mul(gate_up)
+    else:
+        gate, up = gate_up.chunk(2, dim=-1)
+        hidden = F.silu(gate) * up
+    return torch.addmm(residual, hidden, layer.down_proj.t())
 
 
 def forward(weights: Weights, config: ModelConfig, batch: Batch, pool: KVPool) -> torch.Tensor:
@@ -338,7 +345,7 @@ def forward(weights: Weights, config: ModelConfig, batch: Batch, pool: KVPool) -
         h = rms_norm(x, layer.input_norm, config.rms_norm_eps)
         x = attention_block(h, x, layer, i, rope, config, batch, pool)  # x + attention
         h = rms_norm(x, layer.post_attn_norm, config.rms_norm_eps)
-        x = mlp_block(h, x, layer)  # x + mlp
+        x = mlp_block(h, x, layer, batch.use_kernels)  # x + mlp
     x = x[batch.logits_idx]  # drop rows nobody samples from before the expensive part
     return compute_logits(weights, rms_norm(x, weights.final_norm, config.rms_norm_eps))
 
