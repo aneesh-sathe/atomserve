@@ -62,3 +62,24 @@ class ModelConfig:
     def load(cls, model_dir: Path) -> ModelConfig:
         """Read and validate `<model_dir>/config.json`."""
         return cls.from_dict(json.loads((model_dir / "config.json").read_text()))
+
+
+@dataclass(frozen=True)
+class EngineConfig:
+    """Serving limits: how much KV memory exists and how much work one step may do."""
+
+    block_size: int = 16  # tokens per KV block
+    num_blocks: int = 1024  # size of the KV pool, in blocks
+    max_num_seqs: int = 32  # most sequences running (holding KV blocks) at once
+    max_num_batched_tokens: int = 2048  # token budget of one forward pass
+    max_model_len: int = 16384  # longest sequence (prompt + output) accepted
+
+    def __post_init__(self) -> None:
+        if self.max_model_len > self.num_blocks * self.block_size:
+            # Otherwise a lone sequence could outgrow the pool with nobody left to preempt.
+            raise ValueError(
+                f"max_model_len {self.max_model_len} exceeds KV pool capacity "
+                f"{self.num_blocks * self.block_size} tokens"
+            )
+        if self.max_num_batched_tokens < self.max_num_seqs:
+            raise ValueError("max_num_batched_tokens must be >= max_num_seqs (one decode each)")

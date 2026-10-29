@@ -8,8 +8,6 @@ import pytest
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from atomserve.generate import generate_greedy
-
 pytestmark = pytest.mark.slow
 
 RAW_PROMPT = "The capital of France is"
@@ -47,10 +45,10 @@ def test_fp32_logits_match_reference(kind, prompts, weights_fp32, config, hf_mod
 
 
 @pytest.mark.parametrize("kind", ["raw", "chat"])
-def test_greedy_generation_matches_reference(kind, prompts, weights_fp32, config, hf_model):
+def test_greedy_generation_matches_reference(kind, prompts, weights_fp32, config, hf_model, greedy):
     """32 greedy tokens are identical to transformers' own greedy generate()."""
     ids = prompts[kind]
-    ours = generate_greedy(weights_fp32, config, ids, max_new_tokens=32)
+    [ours] = greedy(weights_fp32, config, [ids], 32)
     with torch.inference_mode():
         ref = hf_model.generate(
             torch.tensor([ids]), max_new_tokens=32, min_new_tokens=32, do_sample=False

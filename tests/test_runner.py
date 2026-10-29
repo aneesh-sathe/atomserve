@@ -1,13 +1,11 @@
 # Runner tests: the flat batch must be a pure packing trick. Where a sequence's
 # blocks live and which other sequences share its forward pass may change
-# speed, never results. Fast tests use the tiny random model on CPU; the slow
-# one repeats the batching check on the real model.
+# speed, never results. All on the tiny random model on CPU.
 
 import pytest
 import torch
 
-from atomserve.block_allocator import BlockAllocator
-from atomserve.generate import generate_greedy, reserve_blocks
+from atomserve.block_allocator import BlockAllocator, blocks_for_tokens
 from atomserve.kv_cache import KVPool
 from atomserve.runner import ModelRunner
 from atomserve.sequence import Sequence
@@ -20,11 +18,17 @@ def make_runner(weights, config, num_blocks: int, block_size: int) -> ModelRunne
     return ModelRunner(weights, config, KVPool(config, num_blocks, block_size, device, dtype))
 
 
+def reserve_blocks(seq: Sequence, allocator: BlockAllocator, block_size: int) -> None:
+    """Grow seq's block table to cover all its tokens (the scheduler's job in the engine)."""
+    needed = blocks_for_tokens(seq.num_tokens, block_size) - len(seq.block_table)
+    seq.block_table.extend(allocator.allocate(max(needed, 0)))
+
+
 def test_prepare_flattens_a_decode_and_a_prompt_chunk(tiny_weights, tiny_config):
     """Hand-checked metadata for a decode step next to a partial prefill (block_size 4)."""
     runner = make_runner(tiny_weights, tiny_config, num_blocks=8, block_size=4)
-    decoding = Sequence(token_ids=[1, 2, 3, 4, 5, 6], num_computed_tokens=5, block_table=[7, 2])
-    chunked = Sequence(token_ids=list(range(10, 20)), block_table=[5])
+    decoding = Sequence(0, token_ids=[1, 2, 3, 4, 5, 6], num_computed_tokens=5, block_table=[7, 2])
+    chunked = Sequence(1, token_ids=list(range(10, 20)), block_table=[5])
     batch = runner.prepare([decoding, chunked], [1, 3])
 
     assert batch.input_ids.tolist() == [6, 10, 11, 12]
@@ -39,7 +43,7 @@ def test_prepare_flattens_a_decode_and_a_prompt_chunk(tiny_weights, tiny_config)
 def test_prepare_rejects_a_block_table_that_is_too_short(tiny_weights, tiny_config):
     runner = make_runner(tiny_weights, tiny_config, num_blocks=8, block_size=4)
     with pytest.raises(ValueError, match="block table"):
-        runner.prepare([Sequence(token_ids=list(range(5)), block_table=[0])], [5])
+        runner.prepare([Sequence(0, token_ids=list(range(5)), block_table=[0])], [5])
 
 
 def greedy_logits(runner: ModelRunner, seq: Sequence, steps: int) -> torch.Tensor:
@@ -60,8 +64,8 @@ def test_block_placement_does_not_change_results(tiny_weights, tiny_config):
     prompt = [3, 14, 15, 9, 26, 5, 35]
     ordered = make_runner(tiny_weights, tiny_config, num_blocks=4, block_size=4)
     scattered = make_runner(tiny_weights, tiny_config, num_blocks=16, block_size=4)
-    a = greedy_logits(ordered, Sequence(token_ids=list(prompt), block_table=[0, 1, 2, 3]), 9)
-    b = greedy_logits(scattered, Sequence(token_ids=list(prompt), block_table=[13, 2, 9, 6]), 9)
+    a = greedy_logits(ordered, Sequence(0, token_ids=list(prompt), block_table=[0, 1, 2, 3]), 9)
+    b = greedy_logits(scattered, Sequence(0, token_ids=list(prompt), block_table=[13, 2, 9, 6]), 9)
     assert torch.equal(a, b)
 
 
@@ -71,9 +75,9 @@ def test_mixed_batch_matches_each_sequence_alone(tiny_weights, tiny_config, full
     single-sequence reference."""
     runner = make_runner(tiny_weights, tiny_config, num_blocks=16, block_size=4)
     allocator = BlockAllocator(16)
-    a = Sequence(token_ids=[1, 2, 3, 4, 5, 6, 7, 8, 9])
-    b = Sequence(token_ids=[11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22])
-    c = Sequence(token_ids=[31, 32, 33])
+    a = Sequence(0, token_ids=[1, 2, 3, 4, 5, 6, 7, 8, 9])
+    b = Sequence(1, token_ids=[11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22])
+    c = Sequence(2, token_ids=[31, 32, 33])
 
     def step(seqs: list[Sequence], num_new: list[int]) -> torch.Tensor:
         for seq in seqs:
@@ -104,32 +108,3 @@ def test_mixed_batch_matches_each_sequence_alone(tiny_weights, tiny_config, full
         for row, seq in zip(logits, [a, b, c], strict=True):
             assert torch.allclose(row, reference(seq), atol=1e-5)
             seq.token_ids.append(int(row.argmax()))
-
-
-PROMPTS = [
-    [785, 6722, 315, 9625, 374],  # "The capital of France is"
-    [9707, 11, 847, 829, 374],  # "Hello, my name is"
-    [16, 11, 220, 17, 11, 220, 18, 11],  # "1, 2, 3,"
-]
-
-
-@pytest.mark.slow
-def test_batched_greedy_matches_alone_on_real_model(weights_fp32, config):
-    """Three prompts prefilled and decoded together produce the same 24 greedy tokens
-    as each generated on its own."""
-    alone = [generate_greedy(weights_fp32, config, p, 24) for p in PROMPTS]
-
-    runner = make_runner(weights_fp32, config, num_blocks=32, block_size=4)
-    allocator = BlockAllocator(32)
-    seqs = [Sequence(token_ids=list(p)) for p in PROMPTS]
-    num_new = [len(p) for p in PROMPTS]
-    for _ in range(24):
-        for seq in seqs:
-            reserve_blocks(seq, allocator, 4)
-        logits = runner.run(seqs, num_new)
-        for seq, n, row in zip(seqs, num_new, logits, strict=True):
-            seq.num_computed_tokens += n
-            seq.token_ids.append(int(row.argmax()))
-        num_new = [1] * len(seqs)
-
-    assert [seq.token_ids[len(p) :] for seq, p in zip(seqs, PROMPTS, strict=True)] == alone

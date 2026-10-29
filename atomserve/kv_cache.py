@@ -44,6 +44,12 @@ class KVPool:
         self.num_blocks = num_blocks
         self.block_size = block_size
 
+    @staticmethod
+    def bytes_per_block(config: ModelConfig, block_size: int, dtype: torch.dtype) -> int:
+        """Memory one block takes across all layers, K and V: what sizes the pool."""
+        per_token = config.num_layers * 2 * config.num_kv_heads * config.head_dim
+        return per_token * block_size * dtype.itemsize
+
     def _slots(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         """One layer's pool as flat slot arrays, each [num_blocks * block_size, kv_heads, D].
 

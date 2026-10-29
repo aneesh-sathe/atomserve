@@ -13,12 +13,13 @@ import pytest
 import torch
 
 from atomserve.block_allocator import blocks_for_tokens
-from atomserve.config import ModelConfig
+from atomserve.config import EngineConfig, ModelConfig
+from atomserve.engine import create_engine
 from atomserve.kv_cache import KVPool
 from atomserve.loader import default_device, load_weights, resolve_model_dir
 from atomserve.model import LayerWeights, Weights, forward
 from atomserve.runner import ModelRunner
-from atomserve.sequence import Sequence
+from atomserve.sequence import SamplingParams, Sequence
 
 MODEL_ID = "Qwen/Qwen3-0.6B"
 
@@ -89,11 +90,31 @@ def full_logits() -> Callable[[Weights, ModelConfig, list[int]], torch.Tensor]:
         num_blocks = blocks_for_tokens(len(ids), block_size)
         device, dtype = weights.embed.device, weights.embed.dtype
         runner = ModelRunner(weights, config, KVPool(config, num_blocks, block_size, device, dtype))
-        seq = Sequence(token_ids=list(ids), block_table=list(range(num_blocks)))
+        seq = Sequence(0, token_ids=list(ids), block_table=list(range(num_blocks)))
         batch = runner.prepare([seq], [len(ids)])
         batch = dataclasses.replace(batch, logits_idx=torch.arange(len(ids), device=device))
         with torch.inference_mode():
             return forward(weights, config, batch, runner.pool).cpu()
+
+    return run
+
+
+@pytest.fixture(scope="session")
+def greedy() -> Callable[..., list[list[int]]]:
+    """f(weights, config, prompts, max_tokens, **engine_kwargs) -> output ids per prompt.
+
+    Greedy generation through the real engine (scheduler + paged pool + runner),
+    all prompts batched together. EOS is ignored so every output has exactly
+    `max_tokens` tokens and runs can be compared token for token.
+    """
+
+    def run(weights, config, prompts, max_tokens, **engine_kwargs) -> list[list[int]]:
+        engine_config = EngineConfig(
+            **{"num_blocks": 256, "max_model_len": 4096, "block_size": 16, **engine_kwargs}
+        )
+        engine = create_engine(weights, config, engine_config, frozenset())
+        params = SamplingParams(temperature=0.0, max_tokens=max_tokens, ignore_eos=True)
+        return engine.generate(prompts, params)
 
     return run
 

@@ -4,7 +4,6 @@
 import pytest
 import torch
 
-from atomserve.generate import generate_greedy
 from atomserve.kv_cache import KVPool
 from atomserve.runner import ModelRunner, slot_of
 from atomserve.sequence import Sequence
@@ -52,7 +51,7 @@ def test_prefill_then_decode_logits_equal_full_recompute(weights_fp32, config, f
     device = weights_fp32.embed.device
     pool = KVPool(config, num_blocks=4, block_size=4, device=device, dtype=torch.float32)
     runner = ModelRunner(weights_fp32, config, pool)
-    seq = Sequence(token_ids=list(PROMPT), block_table=[3, 0, 2, 1])
+    seq = Sequence(0, token_ids=list(PROMPT), block_table=[3, 0, 2, 1])
 
     num_new = len(PROMPT)
     for _ in range(9):
@@ -64,8 +63,11 @@ def test_prefill_then_decode_logits_equal_full_recompute(weights_fp32, config, f
 
 
 @pytest.mark.slow
-def test_cached_and_uncached_greedy_agree(weights_fp32, config):
-    """32 greedy tokens are identical with and without the cache."""
-    cached = generate_greedy(weights_fp32, config, PROMPT, 32, use_cache=True)
-    uncached = generate_greedy(weights_fp32, config, PROMPT, 32, use_cache=False)
-    assert cached == uncached
+def test_engine_greedy_equals_argmax_of_full_recompute(weights_fp32, config, greedy, full_logits):
+    """32 greedy tokens through the cached engine equal recomputing the whole sequence
+    from scratch at every step and taking the argmax (the O(N^2) way)."""
+    [cached] = greedy(weights_fp32, config, [PROMPT], 32)
+    ids = list(PROMPT)
+    for _ in range(32):
+        ids.append(int(full_logits(weights_fp32, config, ids)[-1].argmax()))
+    assert cached == ids[len(PROMPT) :]

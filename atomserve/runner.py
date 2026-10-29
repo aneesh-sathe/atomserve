@@ -8,7 +8,7 @@
 # once per step.
 #
 # The runner never changes a sequence. Advancing `num_computed_tokens` and
-# appending sampled tokens is the caller's job, so the same plan can be
+# appending sampled tokens is the scheduler's job, so the same plan can be
 # inspected, tested or retried.
 
 import torch
@@ -16,6 +16,7 @@ import torch
 from atomserve.config import ModelConfig
 from atomserve.kv_cache import KVPool
 from atomserve.model import Batch, Weights, forward
+from atomserve.sampler import Sampler
 from atomserve.sequence import Sequence
 
 
@@ -25,13 +26,14 @@ def slot_of(block_table: list[int], position: int, block_size: int) -> int:
 
 
 class ModelRunner:
-    """Owns the weights and the KV pool; executes one step for a list of sequences."""
+    """Owns the weights, KV pool and sampler; executes one step for a list of sequences."""
 
     def __init__(self, weights: Weights, config: ModelConfig, pool: KVPool):
         self.weights = weights
         self.config = config
         self.pool = pool
         self.device = weights.embed.device
+        self.sampler = Sampler(self.device)
 
     def prepare(self, seqs: list[Sequence], num_new_tokens: list[int]) -> Batch:
         """Flatten one step's work into a Batch.
@@ -64,7 +66,7 @@ class ModelRunner:
             context_slots.extend(slots)
             cu_seqlens.append(cu_seqlens[-1] + n)
             cu_ctxlens.append(cu_ctxlens[-1] + end)
-            if end == len(seq.token_ids):
+            if seq.reaches_end(n):
                 logits_idx.append(cu_seqlens[-1] - 1)
 
         def to_device(values: list[int]) -> torch.Tensor:
@@ -90,3 +92,13 @@ class ModelRunner:
         """
         batch = self.prepare(seqs, num_new_tokens)
         return forward(self.weights, self.config, batch, self.pool)
+
+    @torch.inference_mode()
+    def execute(self, seqs: list[Sequence], num_new_tokens: list[int]) -> list[int]:
+        """Run one step and sample: one new token per sequence that reaches its end.
+
+        The engine's entry point; `run` alone is for callers that want logits.
+        """
+        logits = self.run(seqs, num_new_tokens)
+        sampling = [s for s, n in zip(seqs, num_new_tokens, strict=True) if s.reaches_end(n)]
+        return self.sampler.sample(logits, sampling)
