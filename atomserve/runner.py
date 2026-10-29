@@ -53,14 +53,15 @@ class ModelRunner:
         prompt chunk that stops short has nothing to predict yet.
 
         Context slots for attention are expanded from block tables on the GPU,
-        so host work grows with the number of blocks, not of tokens.
+        so host work grows with the number of blocks, not of tokens. All of the
+        step's integers go to the GPU in a single copy (see `_Upload`).
         """
         bs = self.pool.block_size
         input_ids: list[int] = []
         positions: list[int] = []
         slot_mapping: list[int] = []
         logits_idx: list[int] = []
-        prefills: list[PrefillSpan] = []
+        prefill_spans: list[tuple[slice, list[int], int]] = []  # rows, block table, context
         decode_rows: list[int] = []
         decode_tables: list[list[int]] = []
         decode_lens: list[int] = []
@@ -82,38 +83,42 @@ class ModelRunner:
                 decode_tables.append(table)
                 decode_lens.append(end)
             else:
-                slots = self._expand_slots(self._to_device([table]), end)[0]
-                prefills.append(PrefillSpan(slice(row, row + n), slots))
+                prefill_spans.append((slice(row, row + n), table, end))
             row += n
             if seq.reaches_end(n):
                 logits_idx.append(row - 1)
 
+        upload = _Upload()
+        fields = [upload.add(v) for v in (input_ids, positions, slot_mapping, logits_idx)]
+        prefill_tables = [upload.add(table) for _, table, _ in prefill_spans]
+        width = max((len(t) for t in decode_tables), default=0)
+        tables = upload.add([b for t in decode_tables for b in t + [0] * (width - len(t))])
+        rows, lens = upload.add(decode_rows), upload.add(decode_lens)
+        on_device = upload.send(self.device)
+
         batch = Batch(
-            input_ids=self._to_device(input_ids),
-            positions=self._to_device(positions),
-            slot_mapping=self._to_device(slot_mapping),
-            logits_idx=self._to_device(logits_idx),
-            prefills=prefills,
+            *(on_device[f] for f in fields),
+            prefills=[
+                PrefillSpan(rows, self._expand_slots(on_device[t][None], end)[0])
+                for (rows, _, end), t in zip(prefill_spans, prefill_tables, strict=True)
+            ],
             use_kernels=self.use_kernels,
+            host_buffer=upload.host,
         )
         if decode_rows:
-            width = max(len(t) for t in decode_tables)
-            tables = self._to_device([t + [0] * (width - len(t)) for t in decode_tables])
-            batch.decode_rows = self._to_device(decode_rows)
+            decode_tables_t = on_device[tables].view(len(decode_rows), width)
+            batch.decode_rows = on_device[rows]
             if self.use_kernels:
-                batch.decode_block_tables = tables
-                batch.decode_lens = self._to_device(decode_lens)
+                batch.decode_block_tables = decode_tables_t
+                batch.decode_lens = on_device[lens]
                 batch.decode_max_len = max(decode_lens)
             else:
                 longest = max(decode_lens)
-                batch.decode_slots = self._expand_slots(tables, longest)
+                batch.decode_slots = self._expand_slots(decode_tables_t, longest)
                 if min(decode_lens) < longest:
-                    positions = torch.arange(longest, device=self.device)
-                    batch.decode_mask = positions[None, :] < self._to_device(decode_lens)[:, None]
+                    key_positions = torch.arange(longest, device=self.device)
+                    batch.decode_mask = key_positions[None, :] < on_device[lens][:, None]
         return batch
-
-    def _to_device(self, values: list) -> torch.Tensor:
-        return torch.tensor(values, dtype=torch.long, device=self.device)
 
     def _expand_slots(self, block_tables: torch.Tensor, length: int) -> torch.Tensor:
         """Pool slot of positions 0..length-1 for each row of block tables.
@@ -135,14 +140,51 @@ class ModelRunner:
         into the pool as a side effect.
         """
         batch = self.prepare(seqs, num_new_tokens)
-        return forward(self.weights, self.config, batch, self.pool)
+        logits = forward(self.weights, self.config, batch, self.pool)
+        if logits.is_mps:
+            torch.mps.synchronize()  # the batch's host buffer may be freed once we return
+        return logits
 
     @torch.inference_mode()
     def execute(self, seqs: list[Sequence], num_new_tokens: list[int]) -> list[int]:
         """Run one step and sample: one new token per sequence that reaches its end.
 
         The engine's entry point; `run` alone is for callers that want logits.
+        `batch` stays referenced until sampling has synchronised with the GPU,
+        which keeps its host buffer alive for the asynchronous upload.
         """
-        logits = self.run(seqs, num_new_tokens)
+        batch = self.prepare(seqs, num_new_tokens)
+        logits = forward(self.weights, self.config, batch, self.pool)
         sampling = [s for s, n in zip(seqs, num_new_tokens, strict=True) if s.reaches_end(n)]
-        return self.sampler.sample(logits, sampling)
+        tokens = self.sampler.sample(logits, sampling)
+        del batch  # only now: the GPU has consumed everything it read from the host buffer
+        return tokens
+
+
+class _Upload:
+    """Packs one step's integer arrays into one host tensor, copied to the GPU in one go.
+
+    Each separate small copy costs ~30-140 us on MPS, about as much as a whole
+    decoder layer at batch 1, and a step needs up to a dozen of them. The copy
+    is asynchronous (non_blocking), so the GPU reads the host tensor *later*:
+    it must not be modified or freed until the step has synchronised. The Batch
+    keeps a reference to it (`host_buffer`) for exactly that reason.
+    """
+
+    def __init__(self):
+        self._values: list[int] = []
+        self._parts: list[tuple[int, int]] = []
+        self.host: torch.Tensor | None = None
+
+    def add(self, values: list[int]) -> int:
+        """Queue an array; returns its index into the list `send` returns."""
+        start = len(self._values)
+        self._values.extend(values)
+        self._parts.append((start, len(self._values)))
+        return len(self._parts) - 1
+
+    def send(self, device: torch.device) -> list[torch.Tensor]:
+        """Copy everything to `device`; returns one view per queued array, in order."""
+        self.host = torch.tensor(self._values, dtype=torch.long)
+        on_device = self.host.to(device, non_blocking=True)
+        return [on_device[a:b] for a, b in self._parts]

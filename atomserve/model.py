@@ -99,6 +99,7 @@ class Batch:
     decode_max_len: int = 0
     decode_slots: torch.Tensor | None = None
     decode_mask: torch.Tensor | None = None
+    host_buffer: torch.Tensor | None = None  # source of the async upload; see runner._Upload
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
