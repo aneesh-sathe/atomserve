@@ -242,6 +242,10 @@ class Repl:
             f"{s['generated_tokens']} tokens generated"
         )
         lines.append(
-            f"  KV cache: {s['kv_blocks_used']}/{s['kv_blocks_total']} blocks ({s['kv_usage']:.1%})"
+            f"  KV cache: {s['kv_blocks_used']}/{s['kv_blocks_total']} blocks in use "
+            f"({s['kv_usage']:.1%}), {s['kv_blocks_cached']} holding reusable prefixes"
         )
+        if s["prompt_tokens"]:
+            hit_rate = s["cached_prompt_tokens"] / s["prompt_tokens"]
+            lines.append(f"  prefix cache: {hit_rate:.0%} of all prompt tokens reused")
         return "\n".join(lines)

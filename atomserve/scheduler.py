@@ -22,13 +22,19 @@
 # hogs one giant step: every step stays bounded by the budget, which bounds
 # how long running streams wait for their next token.
 #
+# Prefix caching: on admission, a sequence first looks up its leading full
+# blocks in the allocator's prefix cache and starts with those already
+# "computed"; after every step, its newly completed blocks are registered so
+# later requests can reuse them. A preempted sequence usually finds its own
+# blocks still cached, so recomputing it is cheap too.
+#
 # It only does bookkeeping on Sequence objects and block ids, plain Python
 # with no torch, so every policy decision is testable without a GPU.
 
 from collections import deque
 from dataclasses import dataclass, field
 
-from atomserve.block_allocator import BlockAllocator, blocks_for_tokens
+from atomserve.block_allocator import BlockAllocator, block_hash, blocks_for_tokens
 from atomserve.config import EngineConfig
 from atomserve.sequence import Sequence, SequenceStatus
 
@@ -97,8 +103,12 @@ class Scheduler:
         #    and admitting would just evict someone again next step.
         while self.waiting and not out.preempted and len(self.running) < self.config.max_num_seqs:
             seq = self.waiting[0]
+            if self.config.enable_prefix_caching:
+                self._use_cached_prefix(seq)
             n = min(seq.num_tokens - seq.num_computed_tokens, budget)  # prompt, or a chunk
             if n == 0 or not self._reserve(seq, n):
+                self._release_blocks(seq)  # undo any prefix hit; retry next step
+                seq.num_computed_tokens = seq.num_cached_tokens = 0
                 break
             self.waiting.popleft()
             seq.status = SequenceStatus.RUNNING
@@ -120,6 +130,8 @@ class Scheduler:
         for seq, n in zip(out.seqs, out.num_new_tokens, strict=True):
             sampled_now = seq.reaches_end(n)  # decided before advancing
             seq.num_computed_tokens += n
+            if self.config.enable_prefix_caching:
+                self._register_full_blocks(seq)
             if not sampled_now:
                 continue
             token = next(samples)
@@ -161,9 +173,40 @@ class Scheduler:
             seq.block_table.extend(self.allocator.allocate(missing))
         return True
 
+    def _use_cached_prefix(self, seq: Sequence) -> None:
+        """Start a sequence with KV blocks already in the prefix cache, if any.
+
+        Walks the sequence's full blocks in order and stops at the first miss.
+        At least one token is always left to compute: its logits are needed to
+        sample the next token.
+        """
+        bs = self.config.block_size
+        parent = b""
+        for i in range((seq.num_tokens - 1) // bs):
+            h = block_hash(parent, seq.token_ids[i * bs : (i + 1) * bs])
+            if (block := self.allocator.lookup(h)) is None:
+                break
+            self.allocator.acquire(block)
+            seq.block_table.append(block)
+            seq.block_hashes.append(h)
+            parent = h
+        seq.num_computed_tokens = len(seq.block_table) * bs
+        if not seq.output_ids:  # count hits on the prompt, not on recomputing a preempted reply
+            seq.num_cached_tokens = seq.num_computed_tokens
+
+    def _register_full_blocks(self, seq: Sequence) -> None:
+        """Publish blocks this step completed (all tokens computed) to the prefix cache."""
+        bs = self.config.block_size
+        while len(seq.block_hashes) < seq.num_computed_tokens // bs:
+            i = len(seq.block_hashes)
+            parent = seq.block_hashes[-1] if i else b""
+            h = block_hash(parent, seq.token_ids[i * bs : (i + 1) * bs])
+            self.allocator.register(seq.block_table[i], h)
+            seq.block_hashes.append(h)
+
     def _release_blocks(self, seq: Sequence) -> None:
         self.allocator.free(seq.block_table)
-        seq.block_table = []
+        seq.block_table, seq.block_hashes = [], []
 
     def _preempt(self, seq: Sequence) -> None:
         """Evict a running sequence: free its KV and requeue it at the front."""

@@ -37,6 +37,18 @@ def test_chunked_prefill_matches_whole_prompt_prefill(tiny_weights, tiny_config)
     assert engine.generate(PROMPTS, GREEDY) == alone
 
 
+def test_prefix_cache_hits_do_not_change_outputs(tiny_weights, tiny_config):
+    """Running the same prompts again reuses their cached blocks and gives the same tokens
+    as an engine without prefix caching."""
+    uncached = tiny_engine(tiny_weights, tiny_config, enable_prefix_caching=False)
+    reference = uncached.generate(PROMPTS, GREEDY)
+    engine = tiny_engine(tiny_weights, tiny_config)
+    assert engine.generate(PROMPTS, GREEDY) == reference
+    before = engine.stats()["cached_prompt_tokens"]
+    assert engine.generate(PROMPTS, GREEDY) == reference
+    assert engine.stats()["cached_prompt_tokens"] > before
+
+
 def test_engine_thread_serves_concurrent_clients(tiny_weights, tiny_config):
     """Requests submitted from several threads stream back the same tokens as alone."""
     alone = [tiny_engine(tiny_weights, tiny_config).generate([p], GREEDY)[0] for p in PROMPTS]
@@ -98,6 +110,25 @@ def test_chunked_prefill_matches_on_real_model(weights_fp32, config, greedy):
     [whole] = greedy(weights_fp32, config, [prompt], 16)
     [chunked] = greedy(weights_fp32, config, [prompt], 16, max_num_batched_tokens=64)
     assert chunked == whole
+
+
+@pytest.mark.slow
+def test_prefix_cached_follow_up_matches_uncached_on_real_model(weights_fp32, config):
+    """A follow-up sharing a ~200-token prefix with an earlier request hits the cache
+    and still produces exactly the tokens of a cold engine."""
+    shared = (PROMPTS_REAL[0] + PROMPTS_REAL[1]) * 20
+    first, follow_up = shared + PROMPTS_REAL[2], shared + PROMPTS_REAL[0]
+    params = SamplingParams(temperature=0.0, max_tokens=16, ignore_eos=True)
+
+    def engine(caching: bool):
+        cfg = EngineConfig(num_blocks=128, max_model_len=2048, enable_prefix_caching=caching)
+        return create_engine(weights_fp32, config, cfg, frozenset())
+
+    cold = engine(False).generate([follow_up], params)
+    warm = engine(True)
+    warm.generate([first], params)
+    assert warm.generate([follow_up], params) == cold
+    assert warm.stats()["cached_prompt_tokens"] == len(shared) // 16 * 16
 
 
 @pytest.mark.slow

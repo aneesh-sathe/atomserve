@@ -50,6 +50,11 @@ Full spec and milestones: `~/.claude/plans/i-want-to-build-tidy-stream.md`.
   (head-of-line blocking) and long TTFT 6.4 s; after, TTFT p99 ~95 ms, long TTFT 3.7 s. ITL max is
   ~1150 ms at budget 2048 vs ~325 ms at 512, while a lone 8k prefill is only ~2% slower at 512,
   hence the 512 default.
+- M8 prefix caching, chat about a ~4k-token document: turn 2 (30 output tokens) takes 616 ms
+  with caching vs 1944 ms without; turn-1 cost is unchanged.
+- Prefix-cache invariants: only *fully computed* blocks are hashed (never the partly filled
+  last block); at least one prompt token is always recomputed for its logits; blocks are freed
+  last-first so a prefix's head is evicted last. Mutation-tested in tests/test_scheduler.py.
 - Greedy outputs of identical requests can differ under bf16 when batch composition changes
   (different matmul shapes round differently). In fp32 they are identical, so invariance tests use fp32.
 - E2E terminal tests need the pty as the child's *controlling* tty or Ctrl-C never becomes SIGINT.

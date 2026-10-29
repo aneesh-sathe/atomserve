@@ -4,8 +4,9 @@
 # scheduled tokens into the slots their block tables point to, and it predicts
 # the next token from what it *reads back* from the slots, not from the
 # sequence's own token list. So if the scheduler ever hands a block to two
-# sequences, forgets to recompute after preemption, or mis-sizes a block
-# table, the outputs change and the tests fail, just as real K/V would.
+# sequences wrongly, forgets to recompute after preemption, reuses a cached
+# prefix that doesn't match, or mis-sizes a block table, the outputs change
+# and the tests fail, just as real K/V would.
 
 from atomserve.config import EngineConfig
 from atomserve.runner import slot_of
@@ -43,31 +44,50 @@ def next_token(context: list[int]) -> int:
     return sum((i + 1) * t for i, t in enumerate(context)) % 500
 
 
-def run(
-    prompts: list[list[int]], params=GREEDY, **config
-) -> tuple[list[list[int]], Scheduler, int]:
-    """Drive the scheduler to completion; return outputs, scheduler and preemption count."""
+def make(**config) -> tuple[Scheduler, FakeRunner]:
     cfg = {"block_size": 4, "num_blocks": 64, "max_model_len": 64, **config}
-    scheduler = Scheduler(EngineConfig(**cfg), frozenset({EOS}))
-    runner = FakeRunner(cfg["block_size"])
-    seqs = [Sequence(i, list(p), params) for i, p in enumerate(prompts)]
-    for seq in seqs:
-        scheduler.add(seq)
+    return Scheduler(EngineConfig(**cfg), frozenset({EOS})), FakeRunner(cfg["block_size"])
+
+
+def drive(scheduler: Scheduler, runner: FakeRunner) -> int:
+    """Step until no work is left, checking invariants every step; returns preemptions."""
     preemptions = 0
     while scheduler.has_work:
         out = scheduler.schedule()
         assert out.seqs, "no progress"
         assert len(out.seqs) <= scheduler.config.max_num_seqs
-        assert_blocks_exclusive(scheduler)
+        assert_sharing_is_safe(scheduler)
         preemptions += len(out.preempted)
         scheduler.update(out, runner.execute(out.seqs, out.num_new_tokens))
     assert scheduler.allocator.num_free == scheduler.allocator.num_blocks, "leaked blocks"
+    return preemptions
+
+
+def run(
+    prompts: list[list[int]], params=GREEDY, **config
+) -> tuple[list[list[int]], Scheduler, int]:
+    """Run prompts arriving together; return outputs, the scheduler and the preemption count."""
+    scheduler, runner = make(**config)
+    seqs = [Sequence(i, list(p), params) for i, p in enumerate(prompts)]
+    for seq in seqs:
+        scheduler.add(seq)
+    preemptions = drive(scheduler, runner)
     return [s.output_ids for s in seqs], scheduler, preemptions
 
 
-def assert_blocks_exclusive(scheduler: Scheduler) -> None:
-    owned = [b for s in scheduler.running for b in s.block_table]
-    assert len(owned) == len(set(owned)), "two sequences share a block"
+def assert_sharing_is_safe(scheduler: Scheduler) -> None:
+    """A block may be shared only as the same, fully computed, logical block of each owner."""
+    bs = scheduler.config.block_size
+    owners: dict[int, list[tuple[Sequence, int]]] = {}
+    for seq in scheduler.running:
+        for i, block in enumerate(seq.block_table):
+            owners.setdefault(block, []).append((seq, i))
+    for sharers in owners.values():
+        if len(sharers) > 1:
+            assert len({i for _, i in sharers}) == 1, "shared at different positions"
+            assert all((i + 1) * bs <= s.num_computed_tokens for s, i in sharers), (
+                "shared too early"
+            )
 
 
 PROMPTS = [[1, 2, 3], [4, 5, 6, 7, 8, 9, 10], [11], [12, 13, 14, 15, 16], [17, 18]]
@@ -195,3 +215,86 @@ def test_abort_frees_running_and_waiting_requests():
     assert running.finish_reason == waiting.finish_reason == "abort"
     assert not scheduler.has_work
     assert scheduler.allocator.num_free == 16
+
+
+def test_repeated_prompt_reuses_its_cached_blocks():
+    """The second run of a 10-token prompt starts with its 2 full blocks computed."""
+    scheduler, runner = make()
+    prompt = list(range(40, 50))
+    first = Sequence(0, list(prompt), GREEDY)
+    scheduler.add(first)
+    drive(scheduler, runner)
+    again = Sequence(1, list(prompt), GREEDY)
+    scheduler.add(again)
+    drive(scheduler, runner)
+    assert (first.num_cached_tokens, again.num_cached_tokens) == (0, 8)
+    assert again.output_ids == first.output_ids
+
+
+def test_fully_cached_prompt_still_computes_its_last_token():
+    """An 8-token prompt is exactly 2 blocks; only the first is reused so the last token
+    can run and produce logits."""
+    scheduler, runner = make()
+    for i in range(2):
+        seq = Sequence(i, list(range(8)), GREEDY)
+        scheduler.add(seq)
+        drive(scheduler, runner)
+    assert seq.num_cached_tokens == 4
+
+
+def test_running_requests_share_a_common_prefix():
+    """A request arriving while another with the same 12-token system prompt is still
+    decoding shares its 3 blocks, and both outputs equal running alone."""
+    system = list(range(100, 112))
+    a, b = Sequence(0, system + [1, 2], GREEDY), Sequence(1, system + [3], GREEDY)
+    scheduler, runner = make()
+    scheduler.add(a)
+    for _ in range(2):  # prefill a, then one decode step
+        out = scheduler.schedule()
+        scheduler.update(out, runner.execute(out.seqs, out.num_new_tokens))
+    scheduler.add(b)
+    out = scheduler.schedule()
+    assert b.block_table[:3] == a.block_table[:3]  # shared, refcount 2
+    assert out.num_new_tokens == [1, 1]  # b only computes its 1 uncached token
+    scheduler.update(out, runner.execute(out.seqs, out.num_new_tokens))
+    drive(scheduler, runner)
+    assert a.output_ids == alone(a.token_ids[: a.num_prompt_tokens])
+    assert b.output_ids == alone(b.token_ids[: b.num_prompt_tokens])
+
+
+def test_prefix_caching_under_memory_pressure_keeps_outputs_and_frees_everything():
+    """Shared prefixes, preemption and eviction all at once: outputs are unchanged."""
+    system = [7, 7, 7, 7, 8, 8, 8, 8]
+    prompts = [system + [i, i + 1] for i in range(6)]
+    outputs, _, preemptions = run(prompts, num_blocks=10, max_model_len=40)
+    assert preemptions > 0
+    assert outputs == [alone(p) for p in prompts]
+
+
+def test_prefix_caching_can_be_disabled():
+    scheduler, runner = make(enable_prefix_caching=False)
+    for i in range(2):
+        seq = Sequence(i, list(range(10)), GREEDY)
+        scheduler.add(seq)
+        drive(scheduler, runner)
+    assert seq.num_cached_tokens == 0
+    assert scheduler.allocator.num_cached == 0
+
+
+def test_only_fully_computed_blocks_enter_the_prefix_cache():
+    """A is aborted after prefilling 14 of its 20 tokens: blocks 0-2 are complete, block 3
+    holds K/V for only 2 of its 4 tokens. B, with the same prompt, may reuse the
+    complete blocks and nothing more."""
+    prompt = list(range(60, 80))
+    scheduler, runner = make(max_num_batched_tokens=14, max_num_seqs=4)
+    a = Sequence(0, list(prompt), GREEDY)
+    scheduler.add(a)
+    out = scheduler.schedule()
+    scheduler.update(out, runner.execute(out.seqs, out.num_new_tokens))
+    assert a.num_computed_tokens == 14
+    scheduler.abort(a.id)
+    b = Sequence(1, list(prompt), GREEDY)
+    scheduler.add(b)
+    drive(scheduler, runner)
+    assert b.num_cached_tokens == 12
+    assert b.output_ids == alone(prompt)

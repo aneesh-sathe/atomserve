@@ -100,6 +100,7 @@ class Engine:
         self.last_batch_seqs = 0
         self.last_batch_tokens = 0
         self.num_prompt_tokens = 0
+        self.num_cached_prompt_tokens = 0  # of finished requests: served by the prefix cache
         self.num_generated_tokens = 0
 
     # ---- client side (any thread) -------------------------------------------------
@@ -153,10 +154,12 @@ class Engine:
             "kv_blocks_used": used,
             "kv_blocks_total": s.allocator.num_blocks,
             "kv_usage": used / s.allocator.num_blocks,
+            "kv_blocks_cached": s.allocator.num_cached,
             "steps": self.num_steps,
             "last_batch_seqs": self.last_batch_seqs,
             "last_batch_tokens": self.last_batch_tokens,
             "prompt_tokens": self.num_prompt_tokens,
+            "cached_prompt_tokens": self.num_cached_prompt_tokens,
             "generated_tokens": self.num_generated_tokens,
         }
 
@@ -208,6 +211,7 @@ class Engine:
         """Deliver a finished sequence's final event and drop its per-request state."""
         handle = self._handles.pop(seq.id)
         handle.num_cached_tokens = seq.num_cached_tokens
+        self.num_cached_prompt_tokens += seq.num_cached_tokens
         handle.finished_at = time.perf_counter()
         self.runner.sampler.release(seq.id)
         handle._outbox.put(_Finished(seq.finish_reason or "error", error))

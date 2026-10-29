@@ -60,6 +60,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="token budget of one forward pass; smaller bounds the stall a long prompt "
         "causes running streams, larger prefills a little faster (default 512)",
     )
+    parser.add_argument(
+        "--no-prefix-caching", action="store_true", help="always recompute shared prompt prefixes"
+    )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser
 
@@ -74,6 +77,7 @@ def engine_config_for(args: argparse.Namespace, model_config: ModelConfig) -> En
         max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=args.max_batched_tokens,
         max_model_len=min(model_config.max_position_embeddings, num_blocks * args.block_size),
+        enable_prefix_caching=not args.no_prefix_caching,
     )
 
 
