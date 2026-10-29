@@ -68,18 +68,18 @@ class Sampler:
         if width == 1:  # the whole batch is greedy
             return indices[:, 0].tolist()
 
-        # Per-row settings, in one host-to-device copy.
-        settings = torch.tensor(
+        # Per-row settings, in one asynchronous host-to-device copy. The host tensor
+        # outlives the copy: it stays referenced until .tolist() below synchronises.
+        settings_host = torch.tensor(
             [
                 [p.temperature if p.temperature > 0 else 1.0 for p in params],
                 [p.top_p for p in params],
                 ks,
                 [p.temperature == 0 for p in params],
             ],
-            device=logits.device,
             dtype=torch.float32,
         )
-        temperature, top_p, k, is_greedy = settings
+        temperature, top_p, k, is_greedy = settings_host.to(logits.device, non_blocking=True)
         rank = torch.arange(width, device=logits.device)
         values = (values / temperature[:, None]).masked_fill(rank >= k[:, None], float("-inf"))
         probs = values.softmax(dim=-1)
@@ -96,7 +96,9 @@ class Sampler:
                 noise[i, : ks[i]].exponential_(generator=self._generator(seq))
         choice = (probs / noise.clamp_min(1e-10)).argmax(dim=-1)  # clamp: no 0/0 = NaN
         sampled = indices.gather(1, choice[:, None]).squeeze(1)
-        return torch.where(is_greedy.bool(), indices[:, 0], sampled).tolist()
+        tokens = torch.where(is_greedy.bool(), indices[:, 0], sampled).tolist()
+        del settings_host  # safe now: .tolist() waited for the GPU
+        return tokens
 
 
 def apply_presence_penalty(logits: torch.Tensor, seqs: list[Sequence]) -> torch.Tensor:
