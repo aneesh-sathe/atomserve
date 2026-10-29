@@ -13,8 +13,8 @@ all here:
 - prefix caching
 - batched sampling
 
-There are no frameworks hiding them: about 1,700 lines of code across 15 files, one concept per
-file. Every file opens with a comment explaining its concept; every function documents its
+There are no frameworks hiding them: about 2,300 lines of code across 16 files (including four
+small Metal kernels), one concept per file. Every file opens with a comment explaining its concept; every function documents its
 tensor shapes and the non-obvious "why".
 
 - **Model:** Qwen3 (`Qwen3ForCausalLM`), developed against `Qwen/Qwen3-0.6B`. 1.7B, 4B and
@@ -150,7 +150,8 @@ Dependencies flow one way, top to bottom.
 | `sequence.py` | `Sequence` state machine and `SamplingParams`. |
 | `runner.py` | Flattens a scheduler plan into GPU tensors (the `Batch`), runs the model, samples. |
 | `sampler.py` | Batched sampling: presence penalty, temperature, top-k, top-p, seeded draws. |
-| `model.py` | The Qwen3 transformer as plain functions over a flat batch: RMSNorm, RoPE, GQA, paged attention, SwiGLU. |
+| `model.py` | The Qwen3 transformer as plain functions over a flat batch: RMSNorm, RoPE, GQA, paged attention, SwiGLU. The readable reference; also the CPU path. |
+| `kernels.py` | Metal kernels for the hot spots: fused q/k-norm + RoPE + KV write, paged decode attention, top-k, SiLU·mul. |
 | `kv_cache.py` | The paged KV pool tensors: slot scatter (write) and gather (read). |
 | `loader.py` | Hub download (offline when cached) and the safetensors-to-`Weights` mapping. |
 | `config.py` | `ModelConfig` (validated `config.json`) and `EngineConfig` (serving limits). |
@@ -161,18 +162,24 @@ Each step packs every scheduled sequence's new tokens, prefill chunks and single
 alike, into one list of T tokens with no padding (as in vLLM v1 and nano-vllm):
 
 ```
-input_ids     [T]    new tokens of all sequences, concatenated
-positions     [T]    absolute position of each token (RoPE, causal mask)
-slot_mapping  [T]    KV pool slot each token's K/V is written to
-cu_seqlens    B+1    sequence i owns rows cu_seqlens[i] : cu_seqlens[i+1]
-context_slots        pool slots of each sequence's whole context (cached prefix + new)
-logits_idx    [B']   rows that need a next-token prediction
+input_ids      [T]     new tokens of all sequences, concatenated
+positions      [T]     absolute position of each token (RoPE, causal mask)
+slot_mapping   [T]     KV pool slot each token's K/V is written to
+logits_idx     [B']    rows that need a next-token prediction
+prefills               per prompt chunk: its rows and the pool slots of its whole context
+decode_rows    [Bd]    rows of the sequences with exactly one new token
+decode_block_tables    [Bd, max_blocks] their block tables, padded, plus their context lengths
 ```
 
 Every matmul (QKV, output projection, MLP, lm_head) runs on all `[T, hidden]` rows at once
 without knowing which sequence a row belongs to. Attention is the only operation that needs
-sequence boundaries. The lm_head (151,936 × 1024) runs only on `logits_idx` rows: the last
-token of each sequence that finished its known tokens this step.
+sequence boundaries. Prompt chunks are attended one at a time; there are few per step and each
+is a large piece of work. All decodes share one batched attention call, so a step's launch count
+doesn't grow with the batch. The lm_head (151,936 × 1024) runs only on `logits_idx` rows: the
+last token of each sequence that finished its known tokens this step.
+
+All of a step's integers reach the GPU in one asynchronous copy from a single host buffer.
+On MPS each separate small copy costs 30 to 140 µs, about as much as a whole layer at batch 1.
 
 ### Paged KV cache
 
@@ -192,11 +199,43 @@ slot = block_table[p // block_size] * block_size + p % block_size
 ```
 
 Any free block will do, so memory doesn't fragment and nothing is reserved for a sequence's
-maximum length. Each layer writes the step's new K/V with one `index_copy_` scatter. Attention
-then gathers each sequence's context with `index_select` and calls SDPA with GQA.
+maximum length.
 
-The causal mask is built from absolute positions. SDPA's `is_causal` aligns the triangle to the
-top-left, which is wrong once queries follow a cached prefix.
+The pool starts zeroed rather than uninitialized. The plain-PyTorch decode path pads short
+contexts with slots that may never have been written, then masks them out; a masked key gets
+weight 0, but 0 × NaN is still NaN.
+
+### Metal kernels
+
+`model.py` keeps every operation in plain PyTorch as the readable reference (and the CPU path).
+On the Apple GPU, the runner switches to `kernels.py`, compiled at startup with
+`torch.mps.compile_shader`. Tests check each kernel against the PyTorch version in fp32, and
+check that the whole engine produces identical tokens with kernels on and off.
+
+- **`qk_norm_rope_store`:** one launch per layer, replacing about 16. Thread i of a head's
+  64-thread group owns the RoPE pair (i, i + 64). It RMS-normalizes q and k heads (a simdgroup
+  reduction), rotates them by position with precise trig, writes q out and writes k and v
+  straight into their pool slots.
+- **`paged_decode_attention`:** the PagedAttention "v2" scheme.
+  - Pass 1 runs one threadgroup per (KV head, sequence, 512-key partition) and serves all query
+    heads of the GQA group, so each K/V row is read once.
+  - Lane l of a simdgroup scores key l against the queries; the simdgroup then updates an
+    online softmax and accumulates V, with each lane owning 4 dims.
+  - Pass 2 merges the partitions. With a single partition, pass 1 writes the output itself.
+  - It reaches 200 to 234 GB/s on K/V and is 2 to 3× faster than gathering K/V and calling SDPA.
+- **`topk_rows`:** the sampler's top-k over the 151,936-entry vocabulary.
+  - A threshold first: tau is the k-th largest of the 1,024 threads' maxima. Those k maxima are
+    distinct entries ≥ tau, so the row's whole top k is ≥ tau.
+  - Then each thread keeps a sorted list of its entries ≥ tau, and simd-level merges combine
+    the lists.
+  - It is 4× faster than `torch.topk` on MPS at batch 1 and 22× faster at batch 32.
+- **`silu_mul`:** SwiGLU's `silu(gate) * up` in one pass.
+
+Matmuls and prefill attention stay with PyTorch/MPS, which already run them at 65 to 95% of the
+hardware's limits.
+
+The causal mask for prompt chunks is built from absolute positions. SDPA's `is_causal` aligns
+the triangle to the top-left, which is wrong once queries follow a cached prefix.
 
 ### Scheduler
 
@@ -240,11 +279,14 @@ is a cache hit.
 
 ### Sampling, templates, streaming
 
-- **Sampling** is vectorized across the batch with per-row settings. The pipeline is presence
-  penalty, then temperature, top-k (one `topk` over the widest k in the batch, masked per row),
-  softmax, then top-p. The final draw is an exponential race, `argmax(p / E)` with
-  `E ~ Exp(1)`. It needs no renormalization, and a seeded request draws its own noise from its
-  own generator, independent of its batch neighbours. Temperature 0 is greedy.
+- **Sampling** is vectorized across the batch with per-row settings.
+  - The pipeline is presence penalty, then top-k on the raw logits (one top-k over the widest k
+    in the batch, masked per row), then temperature, softmax and top-p.
+  - Temperature comes after top-k because dividing by a positive temperature doesn't change
+    the ranking, so only k values per row are rescaled. A greedy row is simply its top 1.
+  - The final draw is an exponential race, `argmax(p / E)` with `E ~ Exp(1)`. It needs no
+    renormalization, and a seeded request draws its own noise from its own generator,
+    independent of its batch neighbours.
 - **Chat template:** `tokenizer_config.json`'s Jinja template is rendered with jinja2 using
   transformers' settings, so you see exactly what the model is fed. `enable_thinking=False`
   pre-fills an empty `<think></think>` block. Sampling defaults follow the Qwen3 model card:
@@ -259,19 +301,59 @@ is a cache hit.
 
 Measured on a MacBook Pro with an M4 Pro (24 GB, 273 GB/s) running Qwen3-0.6B in bf16.
 
-Single-sequence decode runs at about 74 tok/s. The bandwidth limit is about 229 tok/s, since
-every decode step must read all 1.19 GB of weights. The gap is per-step overhead: roughly 400
-small GPU kernels launched from Python per token. That's why batching is nearly free throughput:
-the weights are read once per step, however many sequences share it.
+Decode at batch 1 runs at about 130 tok/s. The limit is about 229 tok/s, since every step must
+read all 1.19 GB of weights. The matmuls themselves already run at 75 to 95% of memory
+bandwidth; the rest of each 7.7 ms step is launch overhead, small kernels and sampling. Batching
+is nearly free throughput: the weights are read once per step, however many sequences share it.
 
-`bench/load.py` measures streaming HTTP throughput with 128 output tokens per request:
+**Engine** (`bench/engine.py`: in-process, 128 output tokens, default sampling):
+
+| | Batch 1 | Batch 8 | Batch 32 |
+|---|---|---|---|
+| Decode, 100-token context | 127 tok/s | 919 tok/s | 2,082 tok/s |
+| Decode, 4,000-token context | 103 tok/s | 274 tok/s | |
+
+| Prefill (time to first token) | 1,000 tokens | 8,000 tokens |
+|---|---|---|
+| | 213 ms | 3,072 ms |
+
+Prefill is compute-bound: matmuls and attention both run at about 5 TFLOPS, roughly 65% of peak.
+
+**HTTP** (`bench/load.py`: streaming chat, 128 output tokens per request):
 
 | Concurrency | 1 | 4 | 16 | 32 |
 |---|---|---|---|---|
-| Aggregate decode tok/s | 72 | 221 | 445 | 609 |
-| TTFT p50 (ms) | 23 | 61 | 171 | 250 |
+| Aggregate decode tok/s | 132 | 440 | 1,299 | 2,025 |
+| TTFT p50 (ms) | 12 | 33 | 93 | 108 |
 
-Effect of each technique:
+**Optimization phase.** The same benchmark, run back to back before and after:
+
+| | Before | After | Speedup |
+|---|---|---|---|
+| Decode, batch 1 | 69.5 tok/s | 127 tok/s | 1.8× |
+| Decode, batch 8 | 362 tok/s | 919 tok/s | 2.5× |
+| Decode, batch 32 | 576 tok/s | 2,082 tok/s | 3.6× |
+| Decode, batch 1, 4,000-token context | 51 tok/s | 103 tok/s | 2.0× |
+| Prefill, 1,000 tokens | 270 ms | 213 ms | 1.3× |
+
+What it took, in order. The first profile showed decode spending most of each step on about
+1,700 tiny kernels, not on the matmuls.
+
+1. **Fused RMSNorm and stacked projections.** `F.rms_norm` (one kernel instead of eight) and one
+   matmul each for q/k/v and gate/up.
+2. **One batched attention call for all decodes,** instead of a per-sequence loop.
+3. **Sliced LM head.** MPS picks a slow kernel for the 151,936-wide matmul once there are more
+   than a few rows: 7.7 ms at 32 rows, versus 2.2 ms when sliced into 32k-row pieces.
+4. **Metal kernels:** fused q/k-norm + RoPE + KV write, then paged decode attention.
+5. **Top-k kernel and leaner sampler.** `torch.topk` took 3.6 ms per step at batch 32.
+6. **One asynchronous upload per step.** `torch.tensor(list, device="mps")` costs about 140 µs
+   each.
+7. **Fused residual adds** (`addmm`) and the SiLU·mul kernel.
+
+Tried and dropped: `torch.compile`, which won at batch 8 but not at batch 1 or 32, slowed
+prefill, and doubled startup time.
+
+**Effect of each serving technique** (measured when it was added):
 
 | Technique | Without | With |
 |---|---|---|
@@ -280,13 +362,15 @@ Effect of each technique:
 | Prefix caching (chat turn 2 on a ~4k-token document, 30 output tokens) | 1,944 ms | 616 ms |
 
 With chunked prefill, the longest gap between tokens of a running stream while that 8k prompt
-prefills is about 325 ms at the default 512-token budget, versus about 1,150 ms at 2,048.
+prefills is about 300 ms at the default 512-token budget, versus about 1,150 ms at 2,048.
 
 **Known limit:** identical greedy requests can produce different text in bf16 when they're
 batched differently, because different matmul shapes round differently. In fp32 they are
 identical, which the invariance tests check.
 
 ```sh
+uv run python bench/engine.py --profile                   # per-phase decode step breakdown
+uv run python bench/engine.py --batch 1,8 --context 4000  # long-context decode
 uv run atomserve Qwen/Qwen3-0.6B --no-repl &
 uv run python bench/load.py --concurrency 1,4,16,32
 uv run python bench/load.py --concurrency 8 --long-prompt-tokens 8000
@@ -296,7 +380,7 @@ uv run python bench/load.py --concurrency 8 --long-prompt-tokens 8000
 
 ```sh
 uv run ruff check . && uv run ruff format --check .   # lint and format
-uv run pytest                                         # fast tests, about 1 s, CPU only
+uv run pytest                                         # fast tests, about 1 s (CPU, plus kernels on MPS)
 uv run pytest -m slow                                 # real model on MPS, about 20 s
 ```
 
@@ -313,6 +397,9 @@ The tests prove behavior; they don't just exercise code paths:
   - chunked vs. whole prefill
   - prefix-cached vs. cold
   - preempted vs. never preempted
+- **Metal kernels:** each one matches the PyTorch math in fp32 (long positions, multi-partition
+  contexts, several GQA ratios, ties for top-k), and the engine's tokens are identical with
+  kernels on and off.
 - **Scheduler, without a GPU:** a fake runner simulates the KV pool slot by slot and predicts the
   next token from what it reads back. Sharing a block wrongly, reusing a stale or partial
   prefix, or forgetting to recompute after preemption all change the outputs and fail the
@@ -326,11 +413,8 @@ The tests prove behavior; they don't just exercise code paths:
 
 ## Not yet
 
-Planned optimizations, each to be profiled and benchmarked before and after:
-
-- batched decode attention, replacing the per-sequence loop in `paged_attention`
-- a Metal paged-attention kernel that reads blocks in place, with no gather copy
-- fused RMSNorm, RoPE and SwiGLU kernels
-- removing host syncs, and overlapping CPU batch preparation with GPU execution
-- speculative decoding, with Qwen3-0.6B drafting for Qwen3-4B
-- int8/int4 weight quantization
+- **Speculative decoding**, with Qwen3-0.6B drafting for Qwen3-4B.
+- **int8/int4 weight quantization:** at batch 1, fewer weight bytes per step is the remaining
+  big lever.
+- **Overlapping step N+1's scheduling with step N's GPU work.** The GPU now idles only ~0.3 ms
+  per step, so this is a small win.

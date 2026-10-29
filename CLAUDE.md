@@ -28,6 +28,7 @@ Full spec and milestones: `~/.claude/plans/i-want-to-build-tidy-stream.md`.
 - `uv run atomserve Qwen/Qwen3-0.6B` - chat REPL (`/help` inside) + HTTP API on :11435
 - `uv run atomserve Qwen/Qwen3-0.6B --no-repl --port 11499` - API only (logs requests)
 - `uv run python bench/load.py --url http://127.0.0.1:11499 --concurrency 1,4,16,32` - load test
+- `uv run python bench/engine.py --profile` - in-process decode/prefill benchmark with step breakdown
 
 ## Pitfalls / verified facts
 - Qwen3-0.6B ships `lm_head.weight` even though `tie_word_embeddings=true`; follow the config (use the embedding).
@@ -36,14 +37,27 @@ Full spec and milestones: `~/.claude/plans/i-want-to-build-tidy-stream.md`.
 - `F.scaled_dot_product_attention(..., enable_gqa=True)` works on MPS.
 - SDPA's `is_causal=True` aligns the mask top-left, which is wrong once queries sit after a cached prefix;
   `model.attention` builds an explicit position-based mask instead (skipped for single-token decode).
-- Baseline perf (M2, bf16, single seq, M4 Pro): decode ~80 tok/s vs a ~229 tok/s bandwidth ceiling
-  (1.19 GB weights/step at 273 GB/s), so decode is overhead-bound. 1000-token prompt: prefill ~270 ms;
-  decode 74 tok/s with cache vs 3.6 tok/s without. Always warm up MPS before timing.
-- M4 paged path (bf16): single seq decode ~74 tok/s (short) / ~67 tok/s (1000 ctx), ~10% below M2
-  because each layer gathers the sequence's K/V out of its blocks (`index_select` copy).
-  Lockstep decode, 100-token prompts, aggregate tok/s: B=1 73, B=4 244, B=8 396, B=16 460, B=32 637.
-  Step time grows with B mostly from the per-sequence Python loop in `paged_attention`.
+- Current perf (bf16, M4 Pro, `bench/engine.py`): decode 127 / 919 / 2082 tok/s at B = 1 / 8 / 32
+  (100-token context), 103 tok/s at B=1 with 4k context; prefill 1k 213 ms, 8k 3.07 s. HTTP
+  (`bench/load.py`): 132 / 440 / 1299 / 2025 tok/s at concurrency 1 / 4 / 16 / 32. Ceiling at B=1 is
+  ~229 tok/s (1.19 GB weights/step at 273 GB/s). Pre-optimization (e3dea4b): 69.5 / 362 / 576.
+- Benchmarking: always warm up MPS; compare before/after back to back in one session (runs ~5% apart
+  across sessions); exclude multi-step (chunked) prefill from decode timing; test long contexts too
+  (the first attention kernel looked fine at 100 tokens and was 5x slower than SDPA at 16k).
+- MPS facts measured here: `torch.tensor(list, device="mps")` costs ~140 us (it syncs); build on CPU
+  and `.to(mps, non_blocking=True)`, but the GPU reads the source *later*, so keep it alive and
+  unmodified until the step's sync (runner._Upload). `torch.topk` costs ~110 us per row of 152k.
+  One matmul with N=151,936 and >8 rows hits a slow kernel (7.7 ms at 32 rows vs 2.2 ms sliced).
+  Each small op is ~3-5 us of launch; `F.rms_norm` is one kernel vs eight for the longhand version.
+- `torch.compile` on MPS (torch 2.14) works but was no net win (decode +16% only at B=8, prefill
+  slower, startup 2x), so it is not used.
+- `torch.mps.compile_shader`: Python args bind to `[[buffer(i)]]` in call order, ints arrive as
+  `long`, tensor views with a storage offset bind correctly, `threads=`/`group_size=` take 1-3D tuples.
 - `tensor.view(-1, ...)` of a pool layer + `index_copy_` / `index_select` scatter/gather slots correctly on MPS.
+- The KV pool is zero-initialised on purpose: the PyTorch decode path masks padded keys, but a
+  masked key still multiplies its value by 0, and 0 * NaN (uninitialised memory) is NaN.
+- Metal kernels (kernels.py) assume head_dim 128 and a GQA ratio in (1, 2, 4, 5, 8); otherwise
+  the runner falls back to the PyTorch path. tests/test_kernels.py checks kernels vs PyTorch.
 - Fast tests run the full paged model on a tiny random-weight config on CPU (`tiny_weights` fixture);
   use it for engine invariants instead of the real model where possible.
 - M6 bench (bf16, 128 output tokens, HTTP streaming): aggregate 72 / 221 / 445 / 609 tok/s at
