@@ -7,7 +7,8 @@ import os
 import pty
 import select
 import shutil
-import signal
+import subprocess
+import sys
 import time
 
 import pytest
@@ -41,13 +42,31 @@ def test_empty_think_block_prints_nothing_for_it():
     assert printed(["<think>", "\n\n", "</think>", "\n\n", "Hi"]) == "<dim></dim>Hi</dim>\n"
 
 
+# Runs in the child: make the pty our controlling terminal (so Ctrl-C is a real
+# SIGINT from the tty driver), then become the program under test.
+_CLAIM_TTY = (
+    "import fcntl, os, sys, termios; fcntl.ioctl(0, termios.TIOCSCTTY, 0); "
+    "os.execv(sys.argv[1], sys.argv[1:])"
+)
+
+
 class Terminal:
-    """A child process attached to a pseudo-terminal (its controlling tty)."""
+    """A child process attached to a pseudo-terminal (its controlling tty).
+
+    Spawned with subprocess rather than pty.fork(): forking a multi-threaded
+    process (pytest holds engine threads by now) can deadlock the child.
+    """
 
     def __init__(self, *argv: str):
-        self.pid, self.fd = pty.fork()
-        if self.pid == 0:
-            os.execv(argv[0], list(argv))
+        self.fd, child_end = pty.openpty()
+        self.proc = subprocess.Popen(
+            [sys.executable, "-c", _CLAIM_TTY, *argv],
+            stdin=child_end,
+            stdout=child_end,
+            stderr=child_end,
+            start_new_session=True,  # setsid: a session of its own, ready to own the tty
+        )
+        os.close(child_end)
         self.output = b""
 
     def read_until(self, marker: bytes, timeout: float) -> str:
@@ -71,14 +90,13 @@ class Terminal:
         """Exit code of the child; kills it (and fails) if it does not exit in time."""
         deadline = time.time() + timeout
         while time.time() < deadline:
-            pid, status = os.waitpid(self.pid, os.WNOHANG)
-            if pid:
-                return os.waitstatus_to_exitcode(status)
+            if (code := self.proc.poll()) is not None:
+                return code
             if select.select([self.fd], [], [], 0.1)[0]:
                 with contextlib.suppress(OSError):
                     self.output += os.read(self.fd, 65536)
-        os.kill(self.pid, signal.SIGKILL)
-        os.waitpid(self.pid, 0)
+        self.proc.kill()
+        self.proc.wait()
         raise AssertionError("did not exit: " + self.output[-300:].decode(errors="replace"))
 
 
