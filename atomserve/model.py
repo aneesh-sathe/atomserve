@@ -260,6 +260,7 @@ def decode_attention(
 
 def attention_block(
     x: torch.Tensor,
+    residual: torch.Tensor,
     layer: LayerWeights,
     layer_idx: int,
     rope: tuple[torch.Tensor, torch.Tensor] | torch.Tensor,
@@ -267,10 +268,12 @@ def attention_block(
     batch: Batch,
     pool: KVPool,
 ) -> torch.Tensor:
-    """The attention half of a decoder layer (after its input RMSNorm).
+    """The attention half of a decoder layer.
 
-    x:    [T, hidden]  ->  returns [T, hidden]
-    rope: (cos, sin) tables for the PyTorch path, or the frequencies for the kernel
+    x:        [T, hidden]  the input after the layer's first RMSNorm
+    residual: [T, hidden]  the residual stream, before that norm
+    rope:     (cos, sin) tables for the PyTorch path, or the frequencies for the kernel
+    returns   [T, hidden]  residual + attention output (the add is fused into o_proj)
 
     Project to per-head q/k/v, RMSNorm each q and k head (Qwen3's addition over
     Llama: keeps attention logits well-scaled), rotate q and k by position,
@@ -296,19 +299,24 @@ def attention_block(
         pool.write(layer_idx, k, v, batch.slot_mapping)
 
     out = paged_attention(q, pool, layer_idx, batch)  # [T, num_heads, head_dim]
-    return F.linear(out.reshape(T, config.num_heads * config.head_dim), layer.o_proj)
+    return torch.addmm(residual, out.reshape(T, H * config.head_dim), layer.o_proj.t())
 
 
-def mlp_block(x: torch.Tensor, layer: LayerWeights) -> torch.Tensor:
-    """SwiGLU feed-forward network: down( silu(gate(x)) * up(x) ).
+def mlp_block(x: torch.Tensor, residual: torch.Tensor, layer: LayerWeights) -> torch.Tensor:
+    """SwiGLU feed-forward network: residual + down( silu(gate(x)) * up(x) ).
 
-    x: [T, hidden]  ->  returns [T, hidden]
+    x:        [T, hidden]  the input after the layer's second RMSNorm
+    residual: [T, hidden]  the residual stream, before that norm
+    returns   [T, hidden]
 
     The gate branch, passed through SiLU, decides per channel how much of the up
-    branch to let through. Applied to every token independently.
+    branch to let through. Applied to every token independently. The residual
+    add is fused into the down projection: addmm(residual, a, W^T) is one kernel
+    where `residual + a @ W^T` is two, and at decode a launch costs about as
+    much as the add itself.
     """
     gate, up = F.linear(x, layer.gate_up_proj).chunk(2, dim=-1)
-    return F.linear(F.silu(gate) * up, layer.down_proj)
+    return torch.addmm(residual, F.silu(gate) * up, layer.down_proj.t())
 
 
 def forward(weights: Weights, config: ModelConfig, batch: Batch, pool: KVPool) -> torch.Tensor:
@@ -328,8 +336,9 @@ def forward(weights: Weights, config: ModelConfig, batch: Batch, pool: KVPool) -
         rope = rope_cos_sin(batch.positions, config.head_dim, config.rope_theta, x.dtype)
     for i, layer in enumerate(weights.layers):
         h = rms_norm(x, layer.input_norm, config.rms_norm_eps)
-        x = x + attention_block(h, layer, i, rope, config, batch, pool)
-        x = x + mlp_block(rms_norm(x, layer.post_attn_norm, config.rms_norm_eps), layer)
+        x = attention_block(h, x, layer, i, rope, config, batch, pool)  # x + attention
+        h = rms_norm(x, layer.post_attn_norm, config.rms_norm_eps)
+        x = mlp_block(h, x, layer)  # x + mlp
     x = x[batch.logits_idx]  # drop rows nobody samples from before the expensive part
     return compute_logits(weights, rms_norm(x, weights.final_norm, config.rms_norm_eps))
 
