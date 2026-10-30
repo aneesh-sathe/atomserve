@@ -12,14 +12,17 @@ all here:
 - chunked prefill
 - prefix caching
 - batched sampling
+- speculative decoding with a draft model
+- int8 weight quantization
+- hand-written Metal kernels for the hot paths
 
-There are no frameworks hiding them: about 2,300 lines of code across 16 files (including four
-small Metal kernels), one concept per file. Every file opens with a comment explaining its concept; every function documents its
-tensor shapes and the non-obvious "why".
+There are no frameworks hiding them: about 2,900 lines of code across 18 files (including seven
+Metal kernels), one concept per file. Every file opens with a comment explaining its concept;
+every function documents its tensor shapes and the non-obvious "why".
 
-- **Model:** Qwen3 (`Qwen3ForCausalLM`), developed against `Qwen/Qwen3-0.6B`. 1.7B, 4B and
-  larger Qwen3 checkpoints use the same architecture. Other architectures are rejected at load
-  time.
+- **Models:** Qwen3 (`Qwen3ForCausalLM`). Qwen3-0.6B, 1.7B and 4B have been verified against
+  Hugging Face `transformers`; larger Qwen3 checkpoints share the architecture. Other
+  architectures are rejected at load time.
 - **Scope:** chat and text completion. No tool calling, no multimodal input, one model per process.
 
 ## Quickstart
@@ -110,6 +113,19 @@ aborted and its KV blocks freed.
 | `--max-num-seqs` | `32` | Most requests running at once. |
 | `--max-batched-tokens` | `512` | Token budget of one forward pass (see chunked prefill). |
 | `--no-prefix-caching` | off | Always recompute shared prompt prefixes. |
+| `--quantize int8` | off | int8 weights: half the weight memory, faster decode for 1 to 8 concurrent requests. |
+| `--draft-model` | none | Speculative decoding with this smaller Qwen3 (e.g. `Qwen/Qwen3-0.6B` for 4B). |
+| `--num-speculative-tokens` | `3` | Tokens the draft proposes per step. |
+
+The fastest single-user setup for a bigger model combines both:
+
+```sh
+uv run atomserve Qwen/Qwen3-4B --quantize int8 --draft-model Qwen/Qwen3-0.6B
+```
+
+If weights plus KV cache would exceed the GPU's working set
+(`torch.mps.recommended_max_memory()`), the KV cache is shrunk to fit and a note is printed.
+Past that limit macOS pages GPU memory and every step slows down severalfold, with no error.
 
 ## How it works
 
@@ -151,7 +167,9 @@ Dependencies flow one way, top to bottom.
 | `runner.py` | Flattens a scheduler plan into GPU tensors (the `Batch`), runs the model, samples. |
 | `sampler.py` | Batched sampling: presence penalty, temperature, top-k, top-p, seeded draws. |
 | `model.py` | The Qwen3 transformer as plain functions over a flat batch: RMSNorm, RoPE, GQA, paged attention, SwiGLU. The readable reference; also the CPU path. |
-| `kernels.py` | Metal kernels for the hot spots: fused q/k-norm + RoPE + KV write, paged decode attention, top-k, SiLU·mul. |
+| `kernels.py` | Metal kernels for the hot spots: fused q/k-norm + RoPE + KV write, paged decode attention, top-k, SiLU·mul, int8 matmul. |
+| `speculative.py` | Speculative decoding: draft proposals, one-pass verification by the target, rejection sampling. |
+| `quant.py` | int8 weight quantization: per-row scales, and the matmul that picks a kernel by batch size. |
 | `kv_cache.py` | The paged KV pool tensors: slot scatter (write) and gather (read). |
 | `loader.py` | Hub download (offline when cached) and the safetensors-to-`Weights` mapping. |
 | `config.py` | `ModelConfig` (validated `config.json`) and `EngineConfig` (serving limits). |
@@ -230,9 +248,10 @@ check that the whole engine produces identical tokens with kernels on and off.
     the lists.
   - It is 4× faster than `torch.topk` on MPS at batch 1 and 22× faster at batch 32.
 - **`silu_mul`:** SwiGLU's `silu(gate) * up` in one pass.
+- **`int8_linear`:** the int8 weight-only matmul for 1 to 8 activation rows (see below).
 
-Matmuls and prefill attention stay with PyTorch/MPS, which already run them at 65 to 95% of the
-hardware's limits.
+bf16 matmuls and prefill attention stay with PyTorch/MPS, which already run them at 65 to 95%
+of the hardware's limits.
 
 The causal mask for prompt chunks is built from absolute positions. SDPA's `is_causal` aligns
 the triangle to the top-left, which is wrong once queries follow a cached prefix.
@@ -277,6 +296,59 @@ h_i = sha256(h_{i-1} || tokens of block i)
 A chat resends its whole history every turn, so in practice everything up to the latest message
 is a cache hit.
 
+### Speculative decoding
+
+At batch 1 a step costs about the time to read the target's weights, whether it computes one
+token or five. So a small draft model of the same family proposes k tokens, one cheap step at a
+time, and the target checks all of them in one pass:
+
+```
+draft:   ... t -> d1 -> d2 -> d3               (k sequential draft steps)
+target:  [t, d1, d2, d3] in one pass           -> p1 .. p4
+accept:  d1 kept, d2 kept, d3 rejected         -> d1 d2 + a fix drawn from p3
+```
+
+- **Rejection sampling keeps the output exact.** Draft token d_i, drawn from the draft's
+  distribution q_i, is kept with probability min(1, p_i(d_i) / q_i(d_i)). At the first
+  rejection, the replacement comes from norm(max(0, p_i − q_i)); if every draft survives, a
+  bonus token comes from p_{k+1}. The result has exactly the target's distribution: a bad
+  draft only costs speed. Greedy is the case of one-hot p and q: keep drafts while they match
+  the target's top token.
+- **Rejected tokens need no undo.** Their K/V sit past the sequence's `num_computed_tokens`, so
+  the next step overwrites them. The scheduler reserves the k extra KV slots ("lookahead
+  slots") up front.
+- **One block table, two pools.** Draft and target each have a KV pool, indexed by the same
+  block tables, so allocation, preemption and the prefix cache are shared. A block enters the
+  prefix cache only once both models have computed it. The draft runs prompt chunks with the
+  target and can lag a little during plain decodes, which it catches up on in its next pass.
+- **Verification uses the decode path.** A short multi-token row (a token plus its drafts, or
+  any chunk of at most 8 tokens) is attended as that many single queries, each seeing the keys
+  up to its own position, through the paged decode kernel. That is exactly the causal mask.
+- **Only small batches speculate** (`max_speculative_batch`, default 2). A big batch already
+  shares each weight read between many sequences, so drafting is pure overhead there.
+
+### int8 weight quantization
+
+`--quantize int8` stores every projection matrix as int8 with one scale per output row:
+`scale = max|W[n, :]| / 127`, `W_q = round(W / scale)`. Activations, norms, attention and the
+KV cache stay bf16. On natural text, perplexity stays within about 1% of bf16 and the top
+token matches at 94 to 97% of positions (0.6B, 1.7B, 4B).
+
+The matmul dequantizes on the fly and picks its path by the number of activation rows M:
+
+- **M ≤ 8** (decode, verification, small batches): the `int8_linear` kernel. Each simdgroup
+  computes a few output rows, streams 8 weights per lane per step, dequantizes in registers
+  and reuses each activation load across its rows. M is a template parameter, so the
+  accumulators stay in registers. This reads the weights once, at 1 byte each: 1.4× (0.6B) to
+  1.9× (4B) faster than bf16 at batch 1.
+- **M ≤ 16:** the same kernel on 8-row chunks.
+- **Larger** (prefill): one pass dequantizes the matrix to bf16, then a regular matmul runs.
+  Compute dominates there, so prefill is only about 5% slower than bf16.
+
+The tied lm_head keeps its bf16 matrix, which the embedding needs anyway, for large batches,
+plus an int8 copy for small ones. int8 is a small-batch mode: at batch 32, decode runs at 0.6
+to 0.75× of bf16, because this simple kernel doesn't use the GPU's matrix units.
+
 ### Sampling, templates, streaming
 
 - **Sampling** is vectorized across the batch with per-row settings.
@@ -318,6 +390,19 @@ is nearly free throughput: the weights are read once per step, however many sequ
 | | 213 ms | 3,072 ms |
 
 Prefill is compute-bound: matmuls and attention both run at about 5 TFLOPS, roughly 65% of peak.
+
+**Bigger models, quantization and speculative decoding** (`bench/engine.py --chat`, batch 1,
+128 tokens of a real chat reply):
+
+| | Qwen3-0.6B | Qwen3-4B |
+|---|---|---|
+| bf16 | 133 tok/s | 28 tok/s |
+| int8 | 184 tok/s | 50 tok/s |
+| bf16 + 0.6B draft (k=3) | | 45 tok/s (58% of drafts accepted) |
+| int8 + int8 0.6B draft (k=3) | | 64 tok/s |
+
+At batch 4, int8 is 1.16× (0.6B) and 1.38× (4B) faster than bf16; at batch 8 they are even.
+Speculation pays at batch 1 (1.6×) and 2 (1.1×), which is why it switches off above 2.
 
 **HTTP** (`bench/load.py`: streaming chat, 128 output tokens per request):
 
@@ -398,8 +483,16 @@ The tests prove behavior; they don't just exercise code paths:
   - prefix-cached vs. cold
   - preempted vs. never preempted
 - **Metal kernels:** each one matches the PyTorch math in fp32 (long positions, multi-partition
-  contexts, several GQA ratios, ties for top-k), and the engine's tokens are identical with
-  kernels on and off.
+  contexts, several GQA ratios, ties for top-k, every int8 row count), and the engine's tokens
+  are identical with kernels on and off, quantized or not.
+- **Speculative decoding:**
+  - Greedy output equals the target alone, token for token. This holds with a deliberately
+    bad draft, with chunked prefill, preemption, prefix caching and speculation pausing and
+    resuming. It also holds for real models: Qwen3-1.7B verifying 0.6B drafts in fp32.
+  - Rejection sampling reproduces the target's distribution, checked statistically with a draft
+    that nearly reverses it.
+- **Quantization:** rounding error is bounded per row, and the real model's perplexity stays
+  within 3% of bf16.
 - **Scheduler, without a GPU:** a fake runner simulates the KV pool slot by slot and predicts the
   next token from what it reads back. Sharing a block wrongly, reusing a stale or partial
   prefix, or forgetting to recompute after preemption all change the outputs and fail the
@@ -413,8 +506,8 @@ The tests prove behavior; they don't just exercise code paths:
 
 ## Not yet
 
-- **Speculative decoding**, with Qwen3-0.6B drafting for Qwen3-4B.
-- **int8/int4 weight quantization:** at batch 1, fewer weight bytes per step is the remaining
-  big lever.
-- **Overlapping step N+1's scheduling with step N's GPU work.** The GPU now idles only ~0.3 ms
-  per step, so this is a small win.
+- **An int8 matmul on the GPU's matrix units** (`simdgroup_matrix`), so int8 also wins at large
+  batches.
+- **int4 weights** (group-wise scales), for models that don't fit in bf16 or int8.
+- **Overlapping step N+1's scheduling with step N's GPU work.** The GPU idles only ~0.3 ms per
+  step now, so this is a small win.

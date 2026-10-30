@@ -4,7 +4,8 @@ Minimal, learning-focused LLM inference engine for Apple silicon (PyTorch MPS).
 Full spec and milestones: `~/.claude/plans/i-want-to-build-tidy-stream.md`.
 
 ## Decisions
-- Single model family: Qwen3 (`Qwen3ForCausalLM`), developed against `Qwen/Qwen3-0.6B`. Fail fast on anything else.
+- Single model family: Qwen3 (`Qwen3ForCausalLM`), developed against `Qwen/Qwen3-0.6B`; 1.7B (fp32) and
+  4B (bf16) verified against transformers too. Fail fast on anything else.
 - Chat only, no tool calling.
 - Plain tensors and functions; `transformers` is a dev dependency for golden tests only, never imported by `atomserve/`.
 - One process: engine thread + chat REPL + OpenAI-compatible HTTP (stdlib `http.server`). No asyncio.
@@ -29,6 +30,8 @@ Full spec and milestones: `~/.claude/plans/i-want-to-build-tidy-stream.md`.
 - `uv run atomserve Qwen/Qwen3-0.6B --no-repl --port 11499` - API only (logs requests)
 - `uv run python bench/load.py --url http://127.0.0.1:11499 --concurrency 1,4,16,32` - load test
 - `uv run python bench/engine.py --profile` - in-process decode/prefill benchmark with step breakdown
+- `uv run python bench/engine.py --model Qwen/Qwen3-4B --chat --quantize int8 --draft-model Qwen/Qwen3-0.6B`
+  - bigger model, int8, speculative (use `--chat`: draft acceptance needs real text)
 
 ## Pitfalls / verified facts
 - Qwen3-0.6B ships `lm_head.weight` even though `tie_word_embeddings=true`; follow the config (use the embedding).
@@ -58,6 +61,7 @@ Full spec and milestones: `~/.claude/plans/i-want-to-build-tidy-stream.md`.
   masked key still multiplies its value by 0, and 0 * NaN (uninitialised memory) is NaN.
 - Metal kernels (kernels.py) assume head_dim 128 and a GQA ratio in (1, 2, 4, 5, 8); otherwise
   the runner falls back to the PyTorch path. tests/test_kernels.py checks kernels vs PyTorch.
+  The int8 matmul needs K % 256 == 0 (true for every Qwen3 size) and falls back otherwise.
 - Fast tests run the full paged model on a tiny random-weight config on CPU (`tiny_weights` fixture);
   use it for engine invariants instead of the real model where possible.
 - M6 bench (bf16, 128 output tokens, HTTP streaming): aggregate 72 / 221 / 445 / 609 tok/s at
@@ -78,6 +82,21 @@ Full spec and milestones: `~/.claude/plans/i-want-to-build-tidy-stream.md`.
   `tests/test_repl.py` spawns via subprocess + `TIOCSCTTY`. Pause ~0.3 s after the prompt before
   typing, and never wait on the child without a timeout. Keep reading the pty while waiting for
   exit: macOS blocks a process's exit until its unread terminal output drains.
+- Speculative decoding (4B target, 0.6B draft, batch 1, chat text): 28 -> 45 tok/s bf16, 64 tok/s with
+  int8 for both; k=2-3 best; loses from batch 4 up (verification rows hit MPS's M>8 matmul cost),
+  hence max_speculative_batch=2. Greedy spec == target alone is tested (tiny models + 1.7B/0.6B fp32).
+- int8 (`quant.py`): perplexity within ~1% of bf16 (0.6B/1.7B/4B). Batch-1 decode 1.4x (0.6B), 1.75x (4B);
+  batch 32 only 0.6-0.75x of bf16 (scalar kernel; would need simdgroup_matrix). Template the kernel on
+  M or the accumulators spill (it was 2x slower). `torch._weight_int8pack_mm` on MPS was only fast for
+  one row of a big matrix. Never dequantize through fp32 (`q.float() * scale`) for big models: the
+  temporaries hit the memory limit (4B batch 32 went to 525 ms/step); use kernels.dequantize_int8.
+- `torch.mps.recommended_max_memory()` is 17.8 GiB on this 24 GB machine. Exceeding it (weights + KV)
+  pages GPU memory: every step slows ~2x with no error. cli.fit_kv_budget shrinks the KV cache.
+- A Hub cache entry can be partial (e.g. only config.json fetched by another tool); `snapshot_download
+  (local_files_only=True)` still returns it. loader.missing_files checks before trusting it.
+- Python reads `coding[:=]` in a file's first two lines as an encoding declaration: a header comment like
+  "# Speculative decoding: a ..." is a SyntaxError ("unknown encoding: a"). Ruff doesn't catch it.
+- Benchmarks must count tokens, not steps (a speculative step yields several).
 - Qwen3-0.6B sometimes loops forever while thinking on trick prompts; that is the model, not the engine.
 - Importing `transformers` prints a harmless torch.distributed "Redirects" warning on macOS; the engine never imports it.
 
