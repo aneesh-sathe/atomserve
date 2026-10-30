@@ -138,3 +138,40 @@ def test_silu_mul_matches_pytorch():
         assert torch.allclose(
             kernels.silu_mul(gate_up), torch.nn.functional.silu(gate) * up, atol=1e-5
         )
+
+
+@pytest.mark.parametrize("rows", [0, 1, 3, 5, 8])
+def test_int8_linear_matches_dequantized_matmul(rows):
+    from atomserve.quant import quantize_int8
+
+    w = quantize_int8(torch.randn(1000, 512, device=MPS) * 0.05)  # N not a multiple of 32
+    x = torch.randn(rows, 512, device=MPS)
+    residual = torch.randn(rows, 1000, device=MPS)
+    expected = residual + x @ w.dequantize().T
+    assert torch.allclose(kernels.int8_linear(x, w.q, w.scale, residual), expected, atol=1e-4)
+    assert torch.allclose(kernels.int8_linear(x, w.q, w.scale), expected - residual, atol=1e-4)
+
+
+@pytest.mark.parametrize("rows", [12, 32, 100])
+def test_quantized_linear_paths_agree(rows):
+    """Chunked kernel (12, 32 rows) and dequantize + matmul (100 rows) give the same result."""
+    from atomserve.quant import linear, quantize_int8
+
+    w = quantize_int8(torch.randn(700, 512, device=MPS) * 0.05)
+    x, residual = torch.randn(rows, 512, device=MPS), torch.randn(rows, 700, device=MPS)
+    expected = residual + x @ w.dequantize().T
+    assert torch.allclose(linear(x, w, residual, use_kernels=True), expected, atol=1e-4)
+    deq = kernels.dequantize_int8(w.q, w.scale, torch.float32)
+    assert torch.equal(deq, w.dequantize())
+
+
+def test_quantized_engine_outputs_match_with_kernels_on_and_off():
+    """int8 weights: the Metal kernels (int8 matmul, chunked) agree with dequantize + matmul."""
+    from atomserve.loader import quantize_weights
+
+    weights = random_weights(KERNEL_CONFIG, device="mps")
+    quantize_weights(weights)
+    prompts = [list(range(1, 20)), [5, 6, 7], list(range(30, 41)), list(range(1, 20))]
+    params = SamplingParams(temperature=0.0, max_tokens=12, ignore_eos=True)
+    with_kernels = engine(weights, use_kernels=True).generate(prompts, params)
+    assert with_kernels == engine(weights, use_kernels=False).generate(prompts, params)

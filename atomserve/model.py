@@ -23,6 +23,9 @@ import torch.nn.functional as F
 from atomserve import kernels
 from atomserve.config import ModelConfig
 from atomserve.kv_cache import KVPool
+from atomserve.quant import Int8Weight, linear
+
+Linear = torch.Tensor | Int8Weight  # a projection matrix, plain or quantized
 
 
 @dataclass
@@ -30,17 +33,18 @@ class LayerWeights:
     """Parameters of one decoder layer. Shapes shown for Qwen3-0.6B."""
 
     input_norm: torch.Tensor  # [1024]                 RMSNorm before attention
-    qkv_proj: torch.Tensor  # [(16+8+8)*128, 1024]     hidden -> all q, k and v heads
+    qkv_proj: Linear  # [(16+8+8)*128, 1024]           hidden -> all q, k and v heads
     q_norm: torch.Tensor  # [128]                      RMSNorm applied to each query head
     k_norm: torch.Tensor  # [128]                      RMSNorm applied to each key head
-    o_proj: torch.Tensor  # [1024, 16*128]             concatenated heads -> hidden
+    o_proj: Linear  # [1024, 16*128]                   concatenated heads -> hidden
     post_attn_norm: torch.Tensor  # [1024]             RMSNorm before the MLP
-    gate_up_proj: torch.Tensor  # [2*3072, 1024]       SwiGLU gate and value branches
-    down_proj: torch.Tensor  # [1024, 3072]            back to hidden size
+    gate_up_proj: Linear  # [2*3072, 1024]             SwiGLU gate and value branches
+    down_proj: Linear  # [1024, 3072]                  back to hidden size
 
     # The checkpoint stores q/k/v (and gate/up) as separate matrices; the loader
     # stacks them so each is one matmul. Same math, fewer kernel launches: at
     # decode, every launch has a fixed cost comparable to the matmul itself.
+    # With --quantize int8 the four projections are Int8Weight (quant.py).
 
 
 @dataclass
@@ -51,6 +55,21 @@ class Weights:
     layers: list[LayerWeights]
     final_norm: torch.Tensor  # [hidden]
     lm_head: torch.Tensor  # [vocab, hidden]  same tensor as `embed` when tied
+    lm_head_int8: Int8Weight | None = None  # quantized copy for small batches (--quantize)
+
+    @property
+    def nbytes(self) -> int:
+        """Memory of all distinct parameter tensors (a tied lm_head counts once)."""
+        tensors = {id(t): t for t in (self.embed, self.final_norm, self.lm_head)}
+        quantized = [self.lm_head_int8] if self.lm_head_int8 else []
+        for layer in self.layers:
+            for t in vars(layer).values():
+                if isinstance(t, Int8Weight):
+                    quantized.append(t)
+                else:
+                    tensors[id(t)] = t
+        plain = sum(t.numel() * t.element_size() for t in tensors.values())
+        return plain + sum(q.nbytes for q in quantized)
 
 
 @dataclass
@@ -282,7 +301,7 @@ def attention_block(
     its own key, and past tokens are never re-projected.
     """
     T, H, KV = x.shape[0], config.num_heads, config.num_kv_heads
-    qkv = F.linear(x, layer.qkv_proj).view(T, H + 2 * KV, config.head_dim)
+    qkv = linear(x, layer.qkv_proj, use_kernels=batch.use_kernels).view(T, H + 2 * KV, -1)
 
     if batch.use_kernels:  # everything up to the pool write, fused (kernels.py)
         k_slots, v_slots = pool.layer_slots(layer_idx)
@@ -299,7 +318,7 @@ def attention_block(
         pool.write(layer_idx, k, v, batch.slot_mapping)
 
     out = paged_attention(q, pool, layer_idx, batch)  # [T, num_heads, head_dim]
-    return torch.addmm(residual, out.reshape(T, H * config.head_dim), layer.o_proj.t())
+    return linear(out.reshape(T, H * config.head_dim), layer.o_proj, residual, batch.use_kernels)
 
 
 def mlp_block(
@@ -317,13 +336,13 @@ def mlp_block(
     where `residual + a @ W^T` is two, and at decode a launch costs about as
     much as the add itself. With use_kernels, silu(gate) * up is one Metal kernel.
     """
-    gate_up = F.linear(x, layer.gate_up_proj)  # [T, 2 * intermediate]
+    gate_up = linear(x, layer.gate_up_proj, use_kernels=use_kernels)  # [T, 2 * intermediate]
     if use_kernels:
         hidden = kernels.silu_mul(gate_up)
     else:
         gate, up = gate_up.chunk(2, dim=-1)
         hidden = F.silu(gate) * up
-    return torch.addmm(residual, hidden, layer.down_proj.t())
+    return linear(hidden, layer.down_proj, residual, use_kernels)
 
 
 def forward(weights: Weights, config: ModelConfig, batch: Batch, pool: KVPool) -> torch.Tensor:
@@ -347,10 +366,13 @@ def forward(weights: Weights, config: ModelConfig, batch: Batch, pool: KVPool) -
         h = rms_norm(x, layer.post_attn_norm, config.rms_norm_eps)
         x = mlp_block(h, x, layer, batch.use_kernels)  # x + mlp
     x = x[batch.logits_idx]  # drop rows nobody samples from before the expensive part
-    return compute_logits(weights, rms_norm(x, weights.final_norm, config.rms_norm_eps))
+    hidden = rms_norm(x, weights.final_norm, config.rms_norm_eps)
+    return compute_logits(weights, hidden, batch.use_kernels)
 
 
-def compute_logits(weights: Weights, hidden: torch.Tensor) -> torch.Tensor:
+def compute_logits(
+    weights: Weights, hidden: torch.Tensor, use_kernels: bool = False
+) -> torch.Tensor:
     """Project hidden states to next-token scores over the vocabulary.
 
     hidden: [N, hidden]  only the rows we want predictions for
@@ -361,8 +383,13 @@ def compute_logits(weights: Weights, hidden: torch.Tensor) -> torch.Tensor:
     The vocabulary is projected in slices of LM_HEAD_SLICE rows: MPS picks a
     slow kernel for one very wide matmul once there are more than a few rows
     (32 rows: 7.7 ms whole vs 2.2 ms sliced, on an M4 Pro), and slicing costs
-    nothing for a single row.
+    nothing for a single row. With a quantized copy, a few rows use the int8 kernel
+    instead (half the bytes); more rows use the bf16 matrix, which a tied model
+    keeps anyway for the embedding lookup.
     """
+    small = hidden.shape[0] <= kernels.INT8_MAX_ROWS
+    if weights.lm_head_int8 is not None and small:
+        return linear(hidden, weights.lm_head_int8, use_kernels=use_kernels).float()
     slices = weights.lm_head.split(LM_HEAD_SLICE)
     return torch.cat([F.linear(hidden, w) for w in slices], dim=-1).float()
 

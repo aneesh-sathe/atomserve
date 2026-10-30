@@ -22,6 +22,7 @@ from atomserve.config import EngineConfig, ModelConfig
 from atomserve.engine import create_engine
 from atomserve.kv_cache import KVPool
 from atomserve.loader import default_device, load_weights, resolve_model_dir
+from atomserve.model import Weights
 from atomserve.repl import Repl
 from atomserve.sequence import SamplingParams
 from atomserve.server import OpenAIServer
@@ -45,6 +46,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=11435, help="HTTP API port")
     parser.add_argument(
         "--no-repl", action="store_true", help="serve the HTTP API only, no terminal chat"
+    )
+    parser.add_argument(
+        "--quantize",
+        choices=["int8"],
+        help="store weights as int8 (half the memory, faster small-batch decode)",
     )
     parser.add_argument("--dtype", choices=DTYPES, default="bf16", help="weights and KV cache")
     parser.add_argument(
@@ -100,7 +106,7 @@ def engine_config_for(
     )
 
 
-def fit_kv_budget(args: argparse.Namespace, weights: list, device: torch.device) -> None:
+def fit_kv_budget(args: argparse.Namespace, weights: list[Weights], device: torch.device) -> None:
     """Shrink --kv-mem-gb if weights + KV cache would exceed the GPU's working set.
 
     Past torch.mps.recommended_max_memory(), macOS starts paging GPU memory and
@@ -108,13 +114,7 @@ def fit_kv_budget(args: argparse.Namespace, weights: list, device: torch.device)
     """
     if device.type != "mps":
         return
-    weight_bytes = sum(
-        t.numel() * t.element_size()
-        for w in weights
-        for t in {id(t): t for t in [w.embed, w.lm_head, w.final_norm, *[
-            x for layer in w.layers for x in vars(layer).values()
-        ]]}.values()
-    )  # fmt: skip
+    weight_bytes = sum(w.nbytes for w in weights)
     room_gb = (torch.mps.recommended_max_memory() - weight_bytes) / 2**30 - 1.0
     if args.kv_mem_gb > room_gb:
         if room_gb < 0.25:
@@ -130,8 +130,9 @@ def main(argv: list[str] | None = None) -> int:
     model_dir = resolve_model_dir(args.model)
     model_config = ModelConfig.load(model_dir)
     device = default_device()
-    print(f"Loading {args.model} ({args.dtype}, {device.type}) ...", flush=True)
-    weights = load_weights(model_dir, model_config, device, DTYPES[args.dtype])
+    quant = f", {args.quantize}" if args.quantize else ""
+    print(f"Loading {args.model} ({args.dtype}{quant}, {device.type}) ...", flush=True)
+    weights = load_weights(model_dir, model_config, device, DTYPES[args.dtype], args.quantize)
     tokenizer = ChatTokenizer(model_dir)
     draft = None
     if args.draft_model:
@@ -143,7 +144,10 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(f"Loading draft model {args.draft_model} ...", flush=True)
         draft_config = ModelConfig.load(draft_dir)
-        draft = (load_weights(draft_dir, draft_config, device, DTYPES[args.dtype]), draft_config)
+        draft_weights = load_weights(
+            draft_dir, draft_config, device, DTYPES[args.dtype], args.quantize
+        )
+        draft = (draft_weights, draft_config)
     fit_kv_budget(args, [weights] + ([draft[0]] if draft else []), device)
     engine_config = engine_config_for(args, model_config, draft[1] if draft else None)
     engine = create_engine(weights, model_config, engine_config, tokenizer.eos_token_ids, draft)

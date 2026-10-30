@@ -338,6 +338,79 @@ kernel void silu_mul(
     out[t * I + i] = T(g / (1.0f + exp(-g)) * u);
 }
 
+// int8 weight-only matmul for decode-sized inputs: y = x @ (W_q * scale)^T [+ residual].
+// x has M <= 8 rows (M is a template parameter, so every loop below unrolls and
+// the accumulators stay in registers); W_q is [N, K] int8 with one float scale per
+// output row. Decode reads every weight once per step, so halving the bytes (int8
+// vs bf16) halves the dominant cost. Each simdgroup computes ROWS output rows; each
+// lane streams 8 weights at a time along K, dequantising in registers, and reuses
+// every activation it loads for all ROWS rows. K must be a multiple of 256.
+// (int8_rows_per_group in Python mirrors ROWS: 8 simdgroups per threadgroup.)
+template <typename T, uint M>
+kernel void int8_linear(
+    device T* y                 [[buffer(0)]],   // [M, N]
+    constant T* x               [[buffer(1)]],   // [M, K]
+    constant char* w            [[buffer(2)]],   // [N, K] int8
+    constant float* scale       [[buffer(3)]],   // [N]
+    constant T* residual        [[buffer(4)]],   // [M, N], read only if has_residual
+    constant long& N_           [[buffer(5)]],
+    constant long& K_           [[buffer(6)]],
+    constant long& has_residual [[buffer(7)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint sg    [[simdgroup_index_in_threadgroup]],
+    uint lane  [[thread_index_in_simdgroup]])
+{
+    constexpr uint ROWS = M <= 4 ? 4 : 2;  // fewer rows for bigger M: keeps acc in registers
+    const uint N = N_, K = K_;
+    const uint n0 = (group * 8 + sg) * ROWS;  // 8 simdgroups per threadgroup
+    if (n0 >= N) return;
+    const uint rows = min(ROWS, N - n0);
+
+    float acc[ROWS][M] = {};
+    for (uint k = lane * 8; k < K; k += 32 * 8) {
+        float4 xa[M], xb[M];
+        for (uint m = 0; m < M; ++m) {
+            constant vec<T, 4>* xp = (constant vec<T, 4>*)(x + ulong(m) * K + k);
+            xa[m] = float4(xp[0]);
+            xb[m] = float4(xp[1]);
+        }
+        for (uint r = 0; r < ROWS; ++r) {
+            if (r >= rows) break;
+            constant char4* wp = (constant char4*)(w + ulong(n0 + r) * K + k);
+            const float4 w0 = float4(wp[0]), w1 = float4(wp[1]);
+            for (uint m = 0; m < M; ++m) acc[r][m] += dot(w0, xa[m]) + dot(w1, xb[m]);
+        }
+    }
+    for (uint r = 0; r < rows; ++r) {
+        const uint n = n0 + r;
+        for (uint m = 0; m < M; ++m) {
+            float v = simd_sum(acc[r][m]) * scale[n];
+            if (lane == 0) {
+                if (has_residual) v += float(residual[ulong(m) * N + n]);
+                y[ulong(m) * N + n] = T(v);
+            }
+        }
+    }
+}
+
+// int8 -> T in one pass: out[n, k] = q[n, k] * scale[n]. For big inputs (prefill),
+// where the matmul itself is compute-bound and runs best as a regular matmul.
+template <typename T>
+kernel void dequantize_int8(
+    device vec<T, 4>* out    [[buffer(0)]],   // [N, K / 4]
+    constant char4* q        [[buffer(1)]],   // [N, K / 4]
+    constant float* scale    [[buffer(2)]],   // [N]
+    constant long& K4        [[buffer(3)]],   // K / 4
+    uint2 pos [[thread_position_in_grid]])    // (column / 4, row)
+{
+    const ulong i = ulong(pos.y) * K4 + pos.x;
+    out[i] = vec<T, 4>(float4(q[i]) * scale[pos.y]);
+}
+
+#define INSTANTIATE_INT8(T, NAME, M)                                                      \
+template [[host_name("int8_linear_" NAME "_m" #M)]] kernel void int8_linear<T, M>(         \
+    device T*, constant T*, constant char*, constant float*, constant T*, constant long&, \
+    constant long&, constant long&, uint, uint, uint);
 #define INSTANTIATE_PARTIAL(T, NAME, G)                                                   \
 template [[host_name("decode_attention_partial_" NAME "_g" #G)]] kernel void              \
 decode_attention_partial<T, G>(device float*, device float*, device float4*,              \
@@ -349,6 +422,11 @@ template [[host_name("qk_norm_rope_store_" NAME)]] kernel void qk_norm_rope_stor
     device T*, device T*, device T*, constant T*, constant T*, constant T*,               \
     constant long*, constant long*, constant float*, constant long&, constant long&,      \
     constant float&, uint2, uint2, uint, uint);                                           \
+template [[host_name("dequantize_int8_" NAME)]] kernel void dequantize_int8<T>(            \
+    device vec<T, 4>*, constant char4*, constant float*, constant long&, uint2);          \
+INSTANTIATE_INT8(T, NAME, 1) INSTANTIATE_INT8(T, NAME, 2) INSTANTIATE_INT8(T, NAME, 3)     \
+INSTANTIATE_INT8(T, NAME, 4) INSTANTIATE_INT8(T, NAME, 5) INSTANTIATE_INT8(T, NAME, 6)     \
+INSTANTIATE_INT8(T, NAME, 7) INSTANTIATE_INT8(T, NAME, 8)                                  \
 template [[host_name("silu_mul_" NAME)]] kernel void silu_mul<T>(                          \
     device T*, constant T*, constant long&, uint2);                                       \
 template [[host_name("decode_attention_reduce_" NAME)]] kernel void                       \
@@ -487,5 +565,40 @@ def silu_mul(gate_up: torch.Tensor) -> torch.Tensor:
     out = torch.empty(T, two_i // 2, device=gate_up.device, dtype=gate_up.dtype)
     getattr(_lib(), "silu_mul_" + _SUFFIX[gate_up.dtype])(
         out, gate_up.contiguous(), two_i // 2, threads=(two_i // 2, T), group_size=(256, 1)
+    )
+    return out
+
+
+INT8_MAX_ROWS = 8
+
+
+def int8_linear(
+    x: torch.Tensor, w: torch.Tensor, scale: torch.Tensor, residual: torch.Tensor | None = None
+) -> torch.Tensor:
+    """x @ (w * scale[:, None])^T, plus `residual` if given, for at most INT8_MAX_ROWS rows.
+
+    x: [M, K]  w: [N, K] int8  scale: [N] fp32  residual: [M, N]  ->  [M, N] in x's dtype
+    """
+    M, K = x.shape
+    N = w.shape[0]
+    y = torch.empty(M, N, device=x.device, dtype=x.dtype)
+    if M == 0:  # e.g. a step whose only row is a prompt chunk with nothing to sample
+        return y
+    rows_per_group = 8 * (4 if M <= 4 else 2)  # 8 simdgroups x ROWS (see the kernel)
+    getattr(_lib(), f"int8_linear_{_SUFFIX[x.dtype]}_m{M}")(
+        y, x.contiguous(), w, scale, residual if residual is not None else y,
+        N, K, int(residual is not None),
+        threads=256 * -(-N // rows_per_group),
+        group_size=256,
+    )  # fmt: skip
+    return y
+
+
+def dequantize_int8(q: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """q * scale[:, None] as a regular [N, K] matrix in `dtype` (K a multiple of 4)."""
+    N, K = q.shape
+    out = torch.empty(N, K, device=q.device, dtype=dtype)
+    getattr(_lib(), "dequantize_int8_" + _SUFFIX[dtype])(
+        out, q, scale, K // 4, threads=(K // 4, N), group_size=(256, 1)
     )
     return out

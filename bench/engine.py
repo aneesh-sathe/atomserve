@@ -174,19 +174,20 @@ def main() -> None:
     parser.add_argument("--greedy", action="store_true", help="greedy instead of default sampling")
     parser.add_argument("--draft-model", help="speculative decoding with this draft model")
     parser.add_argument("--num-speculative-tokens", type=int, default=3)
+    parser.add_argument("--quantize", choices=["int8"], help="int8 weights (target and draft)")
     args = parser.parse_args()
+
+    def load(model_dir, config):
+        return load_weights(model_dir, config, default_device(), torch.bfloat16, args.quantize)
 
     model_dir = resolve_model_dir(args.model)
     config = ModelConfig.load(model_dir)
-    weights = load_weights(model_dir, config, default_device(), torch.bfloat16)
+    weights = load(model_dir, config)
     draft, k = None, 0
     if args.draft_model:
         draft_dir = resolve_model_dir(args.draft_model)
         draft_config = ModelConfig.load(draft_dir)
-        draft = (
-            load_weights(draft_dir, draft_config, default_device(), torch.bfloat16),
-            draft_config,
-        )
+        draft = (load(draft_dir, draft_config), draft_config)
         k = args.num_speculative_tokens
     engine = make_engine(weights, config, draft, k)
     bench_decode(engine, 2, 8)  # warm-up: compile MPS kernels, touch the KV pool

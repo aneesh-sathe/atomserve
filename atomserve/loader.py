@@ -13,6 +13,7 @@ from safetensors.torch import load_file
 
 from atomserve.config import ModelConfig
 from atomserve.model import LayerWeights, Weights
+from atomserve.quant import quantize_int8
 
 # Config, tokenizer and weight files. Skips README, images, etc.
 _NEEDED_FILES = ["*.json", "*.safetensors", "*.txt"]
@@ -59,7 +60,11 @@ def resolve_model_dir(model: str) -> Path:
 
 
 def load_weights(
-    model_dir: Path, config: ModelConfig, device: torch.device, dtype: torch.dtype
+    model_dir: Path,
+    config: ModelConfig,
+    device: torch.device,
+    dtype: torch.dtype,
+    quantize: str | None = None,
 ) -> Weights:
     """Read every `*.safetensors` shard and build `Weights` on `device` in `dtype`.
 
@@ -114,4 +119,22 @@ def load_weights(
 
     if raw:
         raise KeyError(f"unexpected tensors in checkpoint: {sorted(raw)[:5]} ...")
-    return Weights(embed=embed, layers=layers, final_norm=final_norm, lm_head=lm_head)
+    weights = Weights(embed=embed, layers=layers, final_norm=final_norm, lm_head=lm_head)
+    if quantize == "int8":
+        quantize_weights(weights)
+    elif quantize is not None:
+        raise ValueError(f"unknown quantization {quantize!r}")
+    return weights
+
+
+def quantize_weights(weights: Weights) -> None:
+    """Replace every layer's projection matrices by int8 versions, in place (see quant.py).
+
+    One matrix at a time, so memory peaks at the bf16 model plus one matrix. The
+    lm_head gets an int8 copy for small batches; the bf16 one stays, as it is
+    the embedding too when tied.
+    """
+    for layer in weights.layers:
+        for name in ("qkv_proj", "o_proj", "gate_up_proj", "down_proj"):
+            setattr(layer, name, quantize_int8(getattr(layer, name)))
+    weights.lm_head_int8 = quantize_int8(weights.lm_head)
