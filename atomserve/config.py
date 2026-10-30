@@ -74,6 +74,7 @@ class EngineConfig:
     max_num_batched_tokens: int = 512  # token budget of one forward pass (bounds a step)
     max_model_len: int = 16384  # longest sequence (prompt + output) accepted
     enable_prefix_caching: bool = True  # reuse KV blocks of identical prompt prefixes
+    num_speculative_tokens: int = 0  # tokens a draft model proposes per step (0: off)
 
     def __post_init__(self) -> None:
         if self.max_model_len > self.num_blocks * self.block_size:

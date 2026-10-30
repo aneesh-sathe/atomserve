@@ -61,6 +61,8 @@ class Sequence:
     block_hashes:        content hash of each *full, computed* block, for prefix caching
     num_cached_tokens:   prompt tokens whose K/V were found in the prefix cache on
                          admission, instead of being computed (for stats)
+    draft_num_computed:  like num_computed_tokens, for the draft model's KV pool
+                         (speculative decoding only; may trail by one token)
     """
 
     id: int
@@ -71,6 +73,7 @@ class Sequence:
     block_table: list[int] = field(default_factory=list)
     block_hashes: list[int] = field(default_factory=list)
     num_cached_tokens: int = 0
+    draft_num_computed: int = 0
     status: SequenceStatus = SequenceStatus.WAITING
     finish_reason: str | None = None  # "stop" (EOS), "length" or "abort"
 
@@ -95,3 +98,18 @@ class Sequence:
         runner both rely on this one definition.
         """
         return self.num_computed_tokens + num_new_tokens == len(self.token_ids)
+
+
+@dataclass
+class StepResult:
+    """What one engine step did for one scheduled sequence. Built by the runner.
+
+    tokens:             new tokens, in order (none for a prompt chunk that stops short;
+                        several when speculative decoding accepted drafted tokens)
+    num_computed:       leading tokens whose target-model K/V are now valid
+    draft_num_computed: the same for the draft model (speculative decoding only)
+    """
+
+    tokens: list[int]
+    num_computed: int
+    draft_num_computed: int = 0

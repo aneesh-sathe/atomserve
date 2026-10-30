@@ -28,6 +28,12 @@
 # later requests can reuse them. A preempted sequence usually finds its own
 # blocks still cached, so recomputing it is cheap too.
 #
+# Speculative decoding: a decoding sequence also gets `num_lookahead` extra KV
+# slots (and token budget) for the tokens a draft model will propose; the
+# runner reports how many were accepted, and the rest are simply never
+# counted as computed. Both models' KV pools share one block table, so a block
+# enters the prefix cache only once *both* have computed it.
+#
 # It only does bookkeeping on Sequence objects and block ids, plain Python
 # with no torch, so every policy decision is testable without a GPU.
 
@@ -36,7 +42,7 @@ from dataclasses import dataclass, field
 
 from atomserve.block_allocator import BlockAllocator, block_hash, blocks_for_tokens
 from atomserve.config import EngineConfig
-from atomserve.sequence import Sequence, SequenceStatus
+from atomserve.sequence import Sequence, SequenceStatus, StepResult
 
 
 @dataclass
@@ -44,17 +50,20 @@ class SchedulerOutput:
     """The plan for one engine step.
 
     seqs[i] runs its next num_new_tokens[i] tokens: its whole prompt, a chunk
-    of it (prefill), or its newest token (decode). `preempted` lists sequences evicted to make
-    room this step; they are waiting again, not part of this step.
+    of it (prefill), or its newest token (decode). A decode may also have
+    num_lookahead[i] > 0: KV slots reserved for that many speculative tokens.
+    `preempted` lists sequences evicted to make room this step; they are
+    waiting again, not part of this step.
     """
 
     seqs: list[Sequence] = field(default_factory=list)
     num_new_tokens: list[int] = field(default_factory=list)
+    num_lookahead: list[int] = field(default_factory=list)
     preempted: list[Sequence] = field(default_factory=list)
 
     @property
     def num_tokens(self) -> int:
-        return sum(self.num_new_tokens)
+        return sum(self.num_new_tokens) + sum(self.num_lookahead)
 
 
 class Scheduler:
@@ -88,7 +97,8 @@ class Scheduler:
             n = min(seq.num_tokens - seq.num_computed_tokens, budget)
             if n == 0:
                 continue  # budget spent; it simply waits for the next step
-            while not self._reserve(seq, n):
+            lookahead = self._lookahead(seq, n, budget)
+            while not self._reserve(seq, n + lookahead):
                 victim = self.running[-1]  # newest first: it has the least work to redo
                 self._preempt(victim)
                 out.preempted.append(victim)
@@ -97,7 +107,8 @@ class Scheduler:
             if seq.status is SequenceStatus.RUNNING:
                 out.seqs.append(seq)
                 out.num_new_tokens.append(n)
-                budget -= n
+                out.num_lookahead.append(lookahead)
+                budget -= n + lookahead
 
         # 2. Admit waiting sequences. Skipped after a preemption: memory is short,
         #    and admitting would just evict someone again next step.
@@ -108,39 +119,45 @@ class Scheduler:
             n = min(seq.num_tokens - seq.num_computed_tokens, budget)  # prompt, or a chunk
             if n == 0 or not self._reserve(seq, n):
                 self._release_blocks(seq)  # undo any prefix hit; retry next step
-                seq.num_computed_tokens = seq.num_cached_tokens = 0
+                seq.num_computed_tokens = seq.draft_num_computed = seq.num_cached_tokens = 0
                 break
             self.waiting.popleft()
             seq.status = SequenceStatus.RUNNING
             self.running.append(seq)
             out.seqs.append(seq)
             out.num_new_tokens.append(n)
+            out.num_lookahead.append(0)
             budget -= n
         return out
 
-    def update(self, out: SchedulerOutput, sampled: list[int]) -> list[tuple[Sequence, int]]:
-        """Apply a finished step: advance sequences, append samples, retire finished ones.
+    def update(
+        self, out: SchedulerOutput, results: list[StepResult]
+    ) -> list[tuple[Sequence, list[int]]]:
+        """Apply a finished step: advance sequences, append new tokens, retire finished ones.
 
-        sampled: one token per sequence of `out` that reached the end of its
-                 known tokens (see Sequence.reaches_end), in order
-        returns  (sequence, new token) pairs; a finished sequence has status FINISHED
+        results[i] is what the runner did for out.seqs[i]
+        returns  (sequence, its new tokens) for every sequence that got any; a finished
+                 sequence has status FINISHED and only the tokens up to its stop
         """
-        samples = iter(sampled)
         new_tokens = []
-        for seq, n in zip(out.seqs, out.num_new_tokens, strict=True):
-            sampled_now = seq.reaches_end(n)  # decided before advancing
-            seq.num_computed_tokens += n
+        for seq, result in zip(out.seqs, results, strict=True):
+            appended = []
+            for token in result.tokens:
+                seq.token_ids.append(token)
+                appended.append(token)
+                if reason := self._finish_reason(seq, token):
+                    self._finish(seq, reason)
+                    break
+            if appended:
+                new_tokens.append((seq, appended))
+            if seq.status is SequenceStatus.FINISHED:
+                continue
+            # K/V exist only for tokens that are in token_ids, and the newest token is
+            # never computed yet (its K/V come with the next step).
+            seq.num_computed_tokens = min(result.num_computed, seq.num_tokens - 1)
+            seq.draft_num_computed = min(result.draft_num_computed, seq.num_computed_tokens)
             if self.config.enable_prefix_caching:
                 self._register_full_blocks(seq)
-            if not sampled_now:
-                continue
-            token = next(samples)
-            seq.token_ids.append(token)
-            new_tokens.append((seq, token))
-            if reason := self._finish_reason(seq, token):
-                self._finish(seq, reason)
-        if next(samples, None) is not None:
-            raise ValueError("more sampled tokens than sampling sequences")
         return new_tokens
 
     def abort(self, seq_id: int) -> Sequence | None:
@@ -162,6 +179,23 @@ class Scheduler:
         if seq.num_tokens >= self.config.max_model_len:
             return "length"
         return None
+
+    def _lookahead(self, seq: Sequence, n: int, budget: int) -> int:
+        """Speculative tokens to reserve for `seq` this step (0 when not speculating).
+
+        Only decodes speculate, and never past the sequence's limits or the step's
+        token budget. A presence penalty depends on every token generated before
+        each position, which drafted tokens would change; those requests don't
+        speculate.
+        """
+        k = self.config.num_speculative_tokens
+        if k == 0 or n != 1 or seq.num_tokens - seq.num_computed_tokens != 1:
+            return 0
+        if seq.params.presence_penalty != 0:
+            return 0
+        remaining_output = seq.params.max_tokens - len(seq.output_ids) - 1
+        remaining_context = self.config.max_model_len - seq.num_tokens - 1
+        return max(0, min(k, budget - n, remaining_output, remaining_context))
 
     def _reserve(self, seq: Sequence, num_new_tokens: int) -> bool:
         """Grow seq's block table to hold `num_new_tokens` more tokens. All or nothing."""
@@ -190,14 +224,21 @@ class Scheduler:
             seq.block_table.append(block)
             seq.block_hashes.append(h)
             parent = h
-        seq.num_computed_tokens = len(seq.block_table) * bs
+        seq.num_computed_tokens = seq.draft_num_computed = len(seq.block_table) * bs
         if not seq.output_ids:  # count hits on the prompt, not on recomputing a preempted reply
             seq.num_cached_tokens = seq.num_computed_tokens
 
     def _register_full_blocks(self, seq: Sequence) -> None:
-        """Publish blocks this step completed (all tokens computed) to the prefix cache."""
+        """Publish blocks this step completed (all tokens computed) to the prefix cache.
+
+        With a draft model, a block counts as computed only once both models'
+        pools hold its K/V: a later request reusing it skips both.
+        """
         bs = self.config.block_size
-        while len(seq.block_hashes) < seq.num_computed_tokens // bs:
+        computed = seq.num_computed_tokens
+        if self.config.num_speculative_tokens:
+            computed = min(computed, seq.draft_num_computed)
+        while len(seq.block_hashes) < computed // bs:
             i = len(seq.block_hashes)
             parent = seq.block_hashes[-1] if i else b""
             h = block_hash(parent, seq.token_ids[i * bs : (i + 1) * bs])
@@ -212,7 +253,7 @@ class Scheduler:
         """Evict a running sequence: free its KV and requeue it at the front."""
         self.running.remove(seq)
         self._release_blocks(seq)
-        seq.num_computed_tokens = 0  # its K/V are gone; recompute prompt + output so far
+        seq.num_computed_tokens = seq.draft_num_computed = 0  # K/V gone: recompute it all
         seq.status = SequenceStatus.WAITING
         self.waiting.appendleft(seq)
 

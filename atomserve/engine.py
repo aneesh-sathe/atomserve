@@ -3,8 +3,8 @@
 #     loop:
 #         take new requests / aborts from the inbox -> scheduler
 #         plan    = scheduler.schedule()        what runs this step (pure Python)
-#         tokens  = runner.execute(plan)        one forward pass + sampling (GPU)
-#         scheduler.update(plan, tokens)        advance sequences, retire finished ones
+#         results = runner.execute(plan)        forward pass(es) + sampling (GPU)
+#         scheduler.update(plan, results)       advance sequences, retire finished ones
 #         push each new token to its request's handle
 #
 # Clients (the REPL, HTTP handler threads) never touch the scheduler or the
@@ -173,19 +173,20 @@ class Engine:
         out = self.scheduler.schedule()
         if not out.seqs:
             raise RuntimeError("scheduler has work but scheduled nothing")
-        tokens = self.runner.execute(out.seqs, out.num_new_tokens)
-        new_tokens = self.scheduler.update(out, tokens)
+        results = self.runner.execute(out)
+        new_tokens = self.scheduler.update(out, results)
 
         now = time.perf_counter()
         self.num_steps += 1
         self.last_batch_seqs, self.last_batch_tokens = len(out.seqs), out.num_tokens
-        for seq, token in new_tokens:
+        for seq, tokens in new_tokens:
             handle = self._handles[seq.id]
             if handle.first_token_at is None:
                 handle.first_token_at = now
-            handle.num_output_tokens += 1
-            self.num_generated_tokens += 1
-            handle._outbox.put(token)
+            handle.num_output_tokens += len(tokens)
+            self.num_generated_tokens += len(tokens)
+            for token in tokens:
+                handle._outbox.put(token)
             if seq.status is SequenceStatus.FINISHED:
                 self._close(seq)
         return True

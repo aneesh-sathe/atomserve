@@ -7,7 +7,7 @@ import torch
 
 from atomserve.block_allocator import BlockAllocator, blocks_for_tokens
 from atomserve.kv_cache import KVPool
-from atomserve.runner import ModelRunner
+from atomserve.runner import ModelRunner, Row, rows_for
 from atomserve.sequence import Sequence
 
 CPU = torch.device("cpu")
@@ -25,31 +25,47 @@ def reserve_blocks(seq: Sequence, allocator: BlockAllocator, block_size: int) ->
 
 
 def test_prepare_flattens_a_decode_and_a_prompt_chunk(tiny_weights, tiny_config):
-    """Hand-checked metadata for a decode step next to a partial prefill (block_size 4)."""
+    """Hand-checked metadata for a decode step next to a long partial prefill (block_size 4)."""
     runner = make_runner(tiny_weights, tiny_config, num_blocks=8, block_size=4)
     decoding = Sequence(0, token_ids=[1, 2, 3, 4, 5, 6], num_computed_tokens=5, block_table=[7, 2])
-    chunked = Sequence(1, token_ids=list(range(10, 20)), block_table=[5])
-    batch = runner.prepare([decoding, chunked], [1, 3])
+    chunked = Sequence(1, token_ids=list(range(10, 30)), block_table=[5, 0, 1])
+    batch = runner.prepare(rows_for([decoding, chunked], [1, 10]))
 
-    assert batch.input_ids.tolist() == [6, 10, 11, 12]
-    assert batch.positions.tolist() == [5, 0, 1, 2]
-    assert batch.slot_mapping.tolist() == [9, 20, 21, 22]  # block 2 offset 1; block 5 offsets 0-2
+    assert batch.input_ids.tolist() == [6, *range(10, 20)]
+    assert batch.positions.tolist() == [5, *range(10)]
+    assert batch.slot_mapping.tolist() == [9, 20, 21, 22, 23, 0, 1, 2, 3, 4, 5]
     assert batch.logits_idx.tolist() == [0]  # the chunk has not reached its last token
     # The decode: row 0, attending to positions 0-5 (blocks 7 and 2).
     assert batch.decode_rows.tolist() == [0]
     assert batch.decode_slots.tolist() == [[28, 29, 30, 31, 8, 9]]
     assert batch.decode_mask is None  # one decode: nothing to pad
-    # The chunk: rows 1-3, attending to positions 0-2 (block 5).
+    # The chunk: rows 1-10, attending to positions 0-9 (blocks 5, 0, 1).
     [span] = batch.prefills
-    assert (span.rows.start, span.rows.stop) == (1, 4)
-    assert span.context_slots.tolist() == [20, 21, 22]
+    assert (span.rows.start, span.rows.stop) == (1, 11)
+    assert span.context_slots.tolist() == [20, 21, 22, 23, 0, 1, 2, 3, 4, 5]
+
+
+def test_short_rows_become_one_decode_query_per_token(tiny_weights, tiny_config):
+    """A 3-token row (a small chunk, or a decode plus drafts to verify) is attended as three
+    single queries; query j sees the keys up to its own position, which is the causal mask."""
+    runner = make_runner(tiny_weights, tiny_config, num_blocks=8, block_size=4)
+    row = Row(tokens=[7, 8, 9], start=5, block_table=[3, 6], num_logits=3)
+    batch = runner.prepare([row])
+    assert batch.prefills == []
+    assert batch.decode_rows.tolist() == [0, 1, 2]
+    assert batch.decode_mask.tolist() == [
+        [True] * 6 + [False] * 2,
+        [True] * 7 + [False],
+        [True] * 8,
+    ]
+    assert batch.logits_idx.tolist() == [0, 1, 2]
 
 
 def test_decodes_of_different_lengths_are_padded_and_masked(tiny_weights, tiny_config):
     runner = make_runner(tiny_weights, tiny_config, num_blocks=8, block_size=4)
     short = Sequence(0, token_ids=[1, 2], num_computed_tokens=1, block_table=[3])
     long = Sequence(1, token_ids=list(range(6)), num_computed_tokens=5, block_table=[1, 6])
-    batch = runner.prepare([short, long], [1, 1])
+    batch = runner.prepare(rows_for([short, long], [1, 1]))
     assert batch.decode_slots.shape == (2, 6)
     assert batch.decode_slots[1].tolist() == [4, 5, 6, 7, 24, 25]
     assert batch.decode_mask.tolist() == [[True] * 2 + [False] * 4, [True] * 6]
@@ -58,7 +74,7 @@ def test_decodes_of_different_lengths_are_padded_and_masked(tiny_weights, tiny_c
 def test_prepare_rejects_a_block_table_that_is_too_short(tiny_weights, tiny_config):
     runner = make_runner(tiny_weights, tiny_config, num_blocks=8, block_size=4)
     with pytest.raises(ValueError, match="block table"):
-        runner.prepare([Sequence(0, token_ids=list(range(5)), block_table=[0])], [5])
+        runner.prepare(rows_for([Sequence(0, token_ids=list(range(5)), block_table=[0])], [5]))
 
 
 def greedy_logits(runner: ModelRunner, seq: Sequence, steps: int) -> torch.Tensor:

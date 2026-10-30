@@ -5,7 +5,6 @@
 # the engine can be fast tests. The real-model fixtures are session-scoped so
 # the checkpoint is read once per run.
 
-import dataclasses
 from collections.abc import Callable
 from pathlib import Path
 
@@ -17,9 +16,9 @@ from atomserve.config import EngineConfig, ModelConfig
 from atomserve.engine import create_engine
 from atomserve.kv_cache import KVPool
 from atomserve.loader import default_device, load_weights, resolve_model_dir
-from atomserve.model import LayerWeights, Weights, forward
-from atomserve.runner import ModelRunner
-from atomserve.sequence import SamplingParams, Sequence
+from atomserve.model import LayerWeights, Weights
+from atomserve.runner import ModelRunner, Row
+from atomserve.sequence import SamplingParams
 
 MODEL_ID = "Qwen/Qwen3-0.6B"
 
@@ -91,11 +90,9 @@ def full_logits() -> Callable[[Weights, ModelConfig, list[int]], torch.Tensor]:
         num_blocks = blocks_for_tokens(len(ids), block_size)
         device, dtype = weights.embed.device, weights.embed.dtype
         runner = ModelRunner(weights, config, KVPool(config, num_blocks, block_size, device, dtype))
-        seq = Sequence(0, token_ids=list(ids), block_table=list(range(num_blocks)))
-        batch = runner.prepare([seq], [len(ids)])
-        batch = dataclasses.replace(batch, logits_idx=torch.arange(len(ids), device=device))
-        with torch.inference_mode():
-            return forward(weights, config, batch, runner.pool).cpu()
+        row = Row(list(ids), 0, list(range(num_blocks)), num_logits=len(ids))
+        logits, _ = runner.forward([row])
+        return logits.cpu()
 
     return run
 

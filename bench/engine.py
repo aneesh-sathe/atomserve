@@ -26,7 +26,8 @@ from atomserve.config import EngineConfig, ModelConfig
 from atomserve.engine import Engine, create_engine
 from atomserve.loader import default_device, load_weights, resolve_model_dir
 from atomserve.model import forward
-from atomserve.sequence import THINKING_PARAMS, SamplingParams
+from atomserve.runner import rows_for
+from atomserve.sequence import THINKING_PARAMS, SamplingParams, StepResult
 
 
 def make_engine(weights, config) -> Engine:
@@ -87,7 +88,7 @@ def profile_decode(
             t0 = time.perf_counter()
             out = scheduler.schedule()
             t1 = time.perf_counter()
-            batch_ = runner.prepare(out.seqs, out.num_new_tokens)
+            batch_ = runner.prepare(rows_for(out.seqs, out.num_new_tokens))
             t2 = time.perf_counter()
             logits = forward(runner.weights, runner.config, batch_, runner.pool)
             t3 = time.perf_counter()
@@ -96,9 +97,13 @@ def profile_decode(
             sampling = [
                 s for s, n in zip(out.seqs, out.num_new_tokens, strict=True) if s.reaches_end(n)
             ]
-            tokens = runner.sampler.sample(logits, sampling)
+            sampled = iter(runner.sampler.sample(logits, sampling))
             t5 = time.perf_counter()
-            scheduler.update(out, tokens)
+            results = [
+                StepResult([next(sampled)] if s.reaches_end(n) else [], s.num_computed_tokens + n)
+                for s, n in zip(out.seqs, out.num_new_tokens, strict=True)
+            ]
+            scheduler.update(out, results)
             t6 = time.perf_counter()
             for name, dt in zip(
                 ["schedule", "prepare", "forward launch", "gpu wait", "sample", "update"],

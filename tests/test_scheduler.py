@@ -10,8 +10,8 @@
 
 from atomserve.config import EngineConfig
 from atomserve.runner import slot_of
-from atomserve.scheduler import Scheduler
-from atomserve.sequence import SamplingParams, Sequence, SequenceStatus
+from atomserve.scheduler import Scheduler, SchedulerOutput
+from atomserve.sequence import SamplingParams, Sequence, SequenceStatus, StepResult
 
 EOS = 999
 GREEDY = SamplingParams(temperature=0.0, max_tokens=12, ignore_eos=True)
@@ -24,19 +24,21 @@ class FakeRunner:
         self.block_size = block_size
         self.slots: dict[int, int] = {}  # slot -> token stored there
 
-    def execute(self, seqs: list[Sequence], num_new_tokens: list[int]) -> list[int]:
-        sampled = []
-        for seq, n in zip(seqs, num_new_tokens, strict=True):
+    def execute(self, out: SchedulerOutput) -> list[StepResult]:
+        results = []
+        for seq, n in zip(out.seqs, out.num_new_tokens, strict=True):
             start, end = seq.num_computed_tokens, seq.num_computed_tokens + n
             assert end <= len(seq.block_table) * self.block_size, "block table too small"
             for p in range(start, end):
                 self.slots[slot_of(seq.block_table, p, self.block_size)] = seq.token_ids[p]
+            tokens = []
             if seq.reaches_end(n):
                 context = [
                     self.slots[slot_of(seq.block_table, p, self.block_size)] for p in range(end)
                 ]
-                sampled.append(next_token(context))
-        return sampled
+                tokens.append(next_token(context))
+            results.append(StepResult(tokens, end))
+        return results
 
 
 def next_token(context: list[int]) -> int:
@@ -58,7 +60,7 @@ def drive(scheduler: Scheduler, runner: FakeRunner) -> int:
         assert len(out.seqs) <= scheduler.config.max_num_seqs
         assert_sharing_is_safe(scheduler)
         preemptions += len(out.preempted)
-        scheduler.update(out, runner.execute(out.seqs, out.num_new_tokens))
+        scheduler.update(out, runner.execute(out))
     assert scheduler.allocator.num_free == scheduler.allocator.num_blocks, "leaked blocks"
     return preemptions
 
@@ -124,7 +126,7 @@ def test_preemption_evicts_the_newest_and_requeues_it_first():
         scheduler.add(seq)
     for _ in range(2):  # prefill 3 tokens, then decode the 4th: one full block each
         out = scheduler.schedule()
-        scheduler.update(out, runner.execute(out.seqs, out.num_new_tokens))
+        scheduler.update(out, runner.execute(out))
     out = scheduler.schedule()  # both now need a second block; only one can grow
     assert out.preempted == [new]
     assert out.seqs == [old]
@@ -157,13 +159,13 @@ def test_long_prompt_is_prefilled_in_chunks_alongside_decodes():
     short, long = Sequence(0, [2, 3], GREEDY), Sequence(1, [1] * 20, GREEDY)
     scheduler.add(short)
     out = scheduler.schedule()
-    scheduler.update(out, runner.execute(out.seqs, out.num_new_tokens))
+    scheduler.update(out, runner.execute(out))
     scheduler.add(long)
     plans = []
     while long.num_computed_tokens < long.num_prompt_tokens:
         out = scheduler.schedule()
         plans.append(list(zip(out.seqs, out.num_new_tokens, strict=True)))
-        scheduler.update(out, runner.execute(out.seqs, out.num_new_tokens))
+        scheduler.update(out, runner.execute(out))
     assert plans == [[(short, 1), (long, 7)], [(short, 1), (long, 7)], [(short, 1), (long, 6)]]
     assert len(long.output_ids) == 1  # sampled only once its last chunk ran
 
@@ -188,10 +190,11 @@ def test_finish_reasons_and_eos():
         scheduler.add(seq)
     while scheduler.has_work:
         out = scheduler.schedule()
-        scheduler.update(
-            out,
-            [7] * sum(s.reaches_end(n) for s, n in zip(out.seqs, out.num_new_tokens, strict=True)),
-        )
+        results = [
+            StepResult([7] if s.reaches_end(n) else [], s.num_computed_tokens + n)
+            for s, n in zip(out.seqs, out.num_new_tokens, strict=True)
+        ]
+        scheduler.update(out, results)
     assert (stops.finish_reason, stops.output_ids) == ("stop", [7])
     assert (ignores.finish_reason, ignores.output_ids) == ("length", [7, 7, 7])
     assert (too_long.finish_reason, too_long.num_tokens) == ("length", 16)
@@ -251,12 +254,12 @@ def test_running_requests_share_a_common_prefix():
     scheduler.add(a)
     for _ in range(2):  # prefill a, then one decode step
         out = scheduler.schedule()
-        scheduler.update(out, runner.execute(out.seqs, out.num_new_tokens))
+        scheduler.update(out, runner.execute(out))
     scheduler.add(b)
     out = scheduler.schedule()
     assert b.block_table[:3] == a.block_table[:3]  # shared, refcount 2
     assert out.num_new_tokens == [1, 1]  # b only computes its 1 uncached token
-    scheduler.update(out, runner.execute(out.seqs, out.num_new_tokens))
+    scheduler.update(out, runner.execute(out))
     drive(scheduler, runner)
     assert a.output_ids == alone(a.token_ids[: a.num_prompt_tokens])
     assert b.output_ids == alone(b.token_ids[: b.num_prompt_tokens])
@@ -290,7 +293,7 @@ def test_only_fully_computed_blocks_enter_the_prefix_cache():
     a = Sequence(0, list(prompt), GREEDY)
     scheduler.add(a)
     out = scheduler.schedule()
-    scheduler.update(out, runner.execute(out.seqs, out.num_new_tokens))
+    scheduler.update(out, runner.execute(out))
     assert a.num_computed_tokens == 14
     scheduler.abort(a.id)
     b = Sequence(1, list(prompt), GREEDY)

@@ -10,6 +10,12 @@
 # The runner never changes a sequence. Advancing `num_computed_tokens` and
 # appending sampled tokens is the scheduler's job, so the same plan can be
 # inspected, tested or retried.
+#
+# The batch is described as `Row`s (a slice of tokens at some positions, plus
+# where their KV goes) rather than as sequences, so speculative decoding can
+# also run tokens that aren't part of any sequence yet: the draft's guesses.
+
+from dataclasses import dataclass
 
 import torch
 
@@ -19,12 +25,47 @@ from atomserve.config import ModelConfig
 from atomserve.kv_cache import KVPool
 from atomserve.model import Batch, PrefillSpan, Weights, forward
 from atomserve.sampler import Sampler
-from atomserve.sequence import Sequence
+from atomserve.scheduler import SchedulerOutput
+from atomserve.sequence import Sequence, StepResult
+
+# Rows with at most this many new tokens (decodes, speculative verification,
+# small prompt chunks) are attended as that many single-query rows, through
+# the batched decode path; longer ones as a prompt chunk.
+MAX_DECODE_QUERIES = 8
 
 
 def slot_of(block_table: list[int], position: int, block_size: int) -> int:
     """Physical pool slot holding the K/V of the token at `position` of a sequence."""
     return block_table[position // block_size] * block_size + position % block_size
+
+
+@dataclass
+class Row:
+    """One sequence's part of a forward pass.
+
+    tokens:      the new tokens, at positions start, start+1, ...
+    start:       position of tokens[0] (everything before it is already in the pool)
+    block_table: the sequence's blocks; must cover every new position
+    num_logits:  how many of the last rows need next-token logits: 1 normally,
+                 0 for a prompt chunk that stops short, all of them to verify drafts
+    """
+
+    tokens: list[int]
+    start: int
+    block_table: list[int]
+    num_logits: int = 1
+
+
+def rows_for(seqs: list[Sequence], num_new_tokens: list[int]) -> list[Row]:
+    """The usual rows: each sequence's next uncomputed tokens, logits only if it reaches its end."""
+    rows = []
+    for seq, n in zip(seqs, num_new_tokens, strict=True):
+        start = seq.num_computed_tokens
+        if n < 1 or start + n > seq.num_tokens:
+            raise ValueError(f"cannot run tokens {start}:{start + n} of {seq.num_tokens}")
+        tokens = seq.token_ids[start : start + n]
+        rows.append(Row(tokens, start, seq.block_table, int(seq.reaches_end(n))))
+    return rows
 
 
 class ModelRunner:
@@ -43,18 +84,14 @@ class ModelRunner:
         self.use_kernels = use_kernels
         self.sampler = Sampler(self.device, use_kernels=use_kernels)
 
-    def prepare(self, seqs: list[Sequence], num_new_tokens: list[int]) -> Batch:
+    def prepare(self, rows: list[Row]) -> Batch:
         """Flatten one step's work into a Batch.
 
-        seqs[i] contributes its next `num_new_tokens[i]` uncomputed tokens:
-        the whole prompt (prefill), a chunk of it, or the single newest token
-        (decode). Its block table must already cover them. A sequence gets a
-        logits row only if this step reaches the end of its known tokens; a
-        prompt chunk that stops short has nothing to predict yet.
-
-        Context slots for attention are expanded from block tables on the GPU,
-        so host work grows with the number of blocks, not of tokens. All of the
-        step's integers go to the GPU in a single copy (see `_Upload`).
+        Each row contributes its new tokens: a whole prompt, a chunk of it, a
+        single decode token, or a decode token plus drafts to verify. Context
+        slots for attention are expanded from block tables on the GPU, so host
+        work grows with the number of blocks, not of tokens. All of the step's
+        integers go to the GPU in a single copy (see `_Upload`).
         """
         bs = self.pool.block_size
         input_ids: list[int] = []
@@ -65,28 +102,28 @@ class ModelRunner:
         decode_rows: list[int] = []
         decode_tables: list[list[int]] = []
         decode_lens: list[int] = []
-        row = 0
+        flat = 0  # index of the row's first token in the flat batch
 
-        for seq, n in zip(seqs, num_new_tokens, strict=True):
-            start, end = seq.num_computed_tokens, seq.num_computed_tokens + n
-            if n < 1 or end > len(seq.token_ids):
-                raise ValueError(f"cannot run tokens {start}:{end} of {len(seq.token_ids)}")
-            if end > len(seq.block_table) * bs:
-                raise ValueError(f"block table holds {len(seq.block_table) * bs} slots, need {end}")
+        for r in rows:
+            n, end = len(r.tokens), r.start + len(r.tokens)
+            if n < 1 or not 0 <= r.num_logits <= n:
+                raise ValueError(f"bad row: {n} tokens, {r.num_logits} logits")
+            if end > len(r.block_table) * bs:
+                raise ValueError(f"block table holds {len(r.block_table) * bs} slots, need {end}")
 
-            input_ids.extend(seq.token_ids[start:end])
-            positions.extend(range(start, end))
-            slot_mapping.extend(slot_of(seq.block_table, p, bs) for p in range(start, end))
-            table = seq.block_table[: blocks_for_tokens(end, bs)]
-            if n == 1:
-                decode_rows.append(row)
-                decode_tables.append(table)
-                decode_lens.append(end)
+            input_ids.extend(r.tokens)
+            positions.extend(range(r.start, end))
+            slot_mapping.extend(slot_of(r.block_table, p, bs) for p in range(r.start, end))
+            table = r.block_table[: blocks_for_tokens(end, bs)]
+            if n <= MAX_DECODE_QUERIES:  # each query on its own, seeing keys up to itself
+                for j in range(n):
+                    decode_rows.append(flat + j)
+                    decode_tables.append(table)
+                    decode_lens.append(r.start + j + 1)
             else:
-                prefill_spans.append((slice(row, row + n), table, end))
-            row += n
-            if seq.reaches_end(n):
-                logits_idx.append(row - 1)
+                prefill_spans.append((slice(flat, flat + n), table, end))
+            logits_idx.extend(range(flat + n - r.num_logits, flat + n))
+            flat += n
 
         upload = _Upload()
         fields = [upload.add(v) for v in (input_ids, positions, slot_mapping, logits_idx)]
@@ -132,33 +169,47 @@ class ModelRunner:
         return block_tables[:, p // bs] * bs + p % bs
 
     @torch.inference_mode()
+    def forward(self, rows: list[Row]) -> tuple[torch.Tensor, Batch]:
+        """Run one forward pass; returns the requested logits [sum(num_logits), vocab] fp32.
+
+        Writes the rows' K/V into the pool. The Batch is returned too and must
+        stay referenced until the caller has synchronised with the GPU (e.g. by
+        reading sampled tokens): its host buffer feeds an asynchronous copy.
+        """
+        batch = self.prepare(rows)
+        return forward(self.weights, self.config, batch, self.pool), batch
+
+    @torch.inference_mode()
     def run(self, seqs: list[Sequence], num_new_tokens: list[int]) -> torch.Tensor:
         """Run one step and return next-token logits, [B', vocab] fp32.
 
         Row j belongs to the j-th sequence (in `seqs` order) that reaches the end
-        of its known tokens this step; see `prepare`. Writes the new tokens' K/V
-        into the pool as a side effect.
+        of its known tokens this step. For tests and tools; the engine uses `execute`.
         """
-        batch = self.prepare(seqs, num_new_tokens)
-        logits = forward(self.weights, self.config, batch, self.pool)
+        logits, _ = self.forward(rows_for(seqs, num_new_tokens))
         if logits.is_mps:
             torch.mps.synchronize()  # the batch's host buffer may be freed once we return
         return logits
 
     @torch.inference_mode()
-    def execute(self, seqs: list[Sequence], num_new_tokens: list[int]) -> list[int]:
-        """Run one step and sample: one new token per sequence that reaches its end.
+    def execute(self, out: SchedulerOutput) -> list[StepResult]:
+        """Run one scheduled step and sample: the engine's entry point.
 
-        The engine's entry point; `run` alone is for callers that want logits.
-        `batch` stays referenced until sampling has synchronised with the GPU,
-        which keeps its host buffer alive for the asynchronous upload.
+        A sequence that reaches the end of its known tokens gets one new token.
         """
-        batch = self.prepare(seqs, num_new_tokens)
-        logits = forward(self.weights, self.config, batch, self.pool)
-        sampling = [s for s, n in zip(seqs, num_new_tokens, strict=True) if s.reaches_end(n)]
-        tokens = self.sampler.sample(logits, sampling)
-        del batch  # only now: the GPU has consumed everything it read from the host buffer
-        return tokens
+        logits, batch = self.forward(rows_for(out.seqs, out.num_new_tokens))
+        sampling = [
+            s for s, n in zip(out.seqs, out.num_new_tokens, strict=True) if s.reaches_end(n)
+        ]
+        sampled = iter(self.sampler.sample(logits, sampling))
+        del batch  # only now: sampling synchronised, so the GPU is done with the host buffer
+        return [
+            StepResult(
+                tokens=[next(sampled)] if seq.reaches_end(n) else [],
+                num_computed=seq.num_computed_tokens + n,
+            )
+            for seq, n in zip(out.seqs, out.num_new_tokens, strict=True)
+        ]
 
 
 class _Upload:
