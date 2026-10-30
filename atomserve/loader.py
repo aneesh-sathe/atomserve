@@ -141,6 +141,10 @@ def load_weights(
 
     if quantize:
         quantize_lm_head(weights, tied=config.tie_word_embeddings)
+    if device.type == "mps":
+        # The allocator keeps freed buffers (the bf16 matrices that became int8) cached
+        # for reuse; hand them back so the KV cache and other processes can have them.
+        torch.mps.empty_cache()
     return weights
 
 
