@@ -46,3 +46,27 @@ def test_kv_pool_is_sized_from_the_memory_budget():
     assert config.max_model_len == 2340 * 16
     small = engine_config_for(build_parser().parse_args(["m", "--kv-mem-gb", "1"]), qwen3_06b)
     assert small.max_model_len == small.num_blocks * 16 < 40960
+
+
+def test_missing_files_detects_a_partial_model_directory(tmp_path):
+    """A cache entry holding only config.json (fetched by another tool) is incomplete."""
+    import json
+
+    from atomserve.loader import missing_files
+
+    (tmp_path / "config.json").write_text("{}")
+    assert "tokenizer.json" in missing_files(tmp_path)
+    assert "model.safetensors" in missing_files(tmp_path)
+    for name in ("generation_config.json", "tokenizer.json", "tokenizer_config.json"):
+        (tmp_path / name).write_text("{}")
+    index = {
+        "weight_map": {
+            "a": "model-00001-of-00002.safetensors",
+            "b": "model-00002-of-00002.safetensors",
+        }
+    }
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps(index))
+    (tmp_path / "model-00001-of-00002.safetensors").write_bytes(b"")
+    assert missing_files(tmp_path) == ["model-00002-of-00002.safetensors"]
+    (tmp_path / "model-00002-of-00002.safetensors").write_bytes(b"")
+    assert missing_files(tmp_path) == []

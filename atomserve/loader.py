@@ -4,6 +4,7 @@
 # files we use, and (2) read the safetensors checkpoint and arrange its tensors
 # into the `Weights` structure that model.py computes with.
 
+import json
 from pathlib import Path
 
 import torch
@@ -22,20 +23,39 @@ def default_device() -> torch.device:
     return torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
 
+def missing_files(model_dir: Path) -> list[str]:
+    """Files atomserve reads that `model_dir` lacks (empty when it is complete).
+
+    Checked because a Hub cache entry can be partial: another tool may have
+    fetched only config.json, and the offline lookup would still return it.
+    """
+    required = ["config.json", "generation_config.json", "tokenizer.json", "tokenizer_config.json"]
+    index = model_dir / "model.safetensors.index.json"
+    if index.exists():  # sharded checkpoint: every shard the index names
+        required += sorted(set(json.loads(index.read_text())["weight_map"].values()))
+    elif not any(model_dir.glob("*.safetensors")):
+        required.append("model.safetensors")
+    return [name for name in required if not (model_dir / name).exists()]
+
+
 def resolve_model_dir(model: str) -> Path:
     """Map a local directory or a Hub id like "Qwen/Qwen3-0.6B" to a local directory.
 
     Hub downloads land in the standard Hugging Face cache, so they are shared
-    with other tools and only fetched once. A cached copy is used without touching
-    the network, which keeps startup fast and lets atomserve run offline.
+    with other tools and only fetched once. A complete cached copy is used
+    without touching the network, which keeps startup fast and lets atomserve
+    run offline; an incomplete one is topped up.
     """
     path = Path(model).expanduser()
     if path.is_dir():
         return path
     try:
-        return Path(snapshot_download(model, allow_patterns=_NEEDED_FILES, local_files_only=True))
-    except FileNotFoundError:  # not cached yet (LocalEntryNotFoundError subclasses this)
-        return Path(snapshot_download(model, allow_patterns=_NEEDED_FILES))
+        cached = Path(snapshot_download(model, allow_patterns=_NEEDED_FILES, local_files_only=True))
+        if not missing_files(cached):
+            return cached
+    except FileNotFoundError:  # not cached at all (LocalEntryNotFoundError subclasses this)
+        pass
+    return Path(snapshot_download(model, allow_patterns=_NEEDED_FILES))
 
 
 def load_weights(
