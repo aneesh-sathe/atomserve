@@ -248,4 +248,7 @@ class Repl:
         if s["prompt_tokens"]:
             hit_rate = s["cached_prompt_tokens"] / s["prompt_tokens"]
             lines.append(f"  prefix cache: {hit_rate:.0%} of all prompt tokens reused")
+        if s["draft_tokens"]:
+            rate = s["accepted_draft_tokens"] / s["draft_tokens"]
+            lines.append(f"  speculative decoding: {rate:.0%} of draft tokens accepted")
         return "\n".join(lines)

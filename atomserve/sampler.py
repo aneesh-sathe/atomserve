@@ -15,10 +15,32 @@
 # renormalisation after masking, and lets a seeded request draw its noise
 # from its own generator while unseeded rows share one.
 
+from dataclasses import dataclass
+
 import torch
 
 from atomserve import kernels
 from atomserve.sequence import Sequence
+
+
+@dataclass
+class Candidates:
+    """Each row's sampling distribution, in sparse form.
+
+    probs:   [B, W] fp32, the row's probabilities after top-k / temperature / top-p
+             (zero for tokens filtered out; a greedy row is a single 1.0)
+    indices: [B, W] the token ids those probabilities belong to, best first
+    ks:      host ints, how many of the W columns row i may use
+    """
+
+    probs: torch.Tensor
+    indices: torch.Tensor
+    ks: list[int]
+
+    def dense(self, vocab: int) -> torch.Tensor:
+        """The same distributions as full [B, vocab] probability vectors."""
+        out = torch.zeros(self.probs.shape[0], vocab, device=self.probs.device)
+        return out.scatter_(1, self.indices, self.probs)
 
 
 class Sampler:
@@ -29,18 +51,27 @@ class Sampler:
         self.device = device
         self.use_kernels = use_kernels
         self._generators: dict[int, torch.Generator] = {}
+        # Host tensors still being copied to the GPU asynchronously; kept alive until
+        # the caller has synchronised (see `synced`).
+        self._in_flight: list[torch.Tensor] = []
 
     def release(self, seq_id: int) -> None:
         """Forget a finished request's generator."""
         self._generators.pop(seq_id, None)
 
-    def _generator(self, seq: Sequence) -> torch.Generator:
-        """The request's own generator, created from its seed on first use."""
+    def generator(self, seq: Sequence) -> torch.Generator | None:
+        """The request's own generator if it is seeded (created on first use), else None."""
+        if seq.params.seed is None:
+            return None
         if seq.id not in self._generators:
             g = torch.Generator(device=self.device)
             g.manual_seed(seq.params.seed)
             self._generators[seq.id] = g
         return self._generators[seq.id]
+
+    def synced(self) -> None:
+        """Call after reading results back from the GPU: frees the uploads' host buffers."""
+        self._in_flight.clear()
 
     def top_k(self, logits: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Each row's k largest logits and their token ids, best first: ([B, k], [B, k])."""
@@ -48,14 +79,11 @@ class Sampler:
             return kernels.topk_rows(logits, k)
         return logits.topk(k, dim=-1)
 
-    def sample(self, logits: torch.Tensor, seqs: list[Sequence]) -> list[int]:
-        """Choose one next token per row.
+    def candidates(self, logits: torch.Tensor, seqs: list[Sequence]) -> Candidates:
+        """Turn logits into each row's sampling distribution (rows may repeat a sequence).
 
-        logits: [B, vocab] fp32, row i belongs to seqs[i]
-        returns B token ids (one host sync, here, per engine step)
+        logits: [B, vocab] fp32, row i sampled with seqs[i]'s settings
         """
-        if not seqs:  # a step that only advanced prompt chunks
-            return []
         vocab = logits.shape[1]
         params = [s.params for s in seqs]
         logits = apply_presence_penalty(logits, seqs)
@@ -66,20 +94,19 @@ class Sampler:
         width = max(ks)
         values, indices = self.top_k(logits, width)  # [B, width], sorted, best first
         if width == 1:  # the whole batch is greedy
-            return indices[:, 0].tolist()
+            return Candidates(torch.ones_like(values), indices, ks)
 
-        # Per-row settings, in one asynchronous host-to-device copy. The host tensor
-        # outlives the copy: it stays referenced until .tolist() below synchronises.
-        settings_host = torch.tensor(
+        # Per-row settings, in one asynchronous host-to-device copy.
+        settings = torch.tensor(
             [
                 [p.temperature if p.temperature > 0 else 1.0 for p in params],
                 [p.top_p for p in params],
                 ks,
-                [p.temperature == 0 for p in params],
             ],
             dtype=torch.float32,
         )
-        temperature, top_p, k, is_greedy = settings_host.to(logits.device, non_blocking=True)
+        self._in_flight.append(settings)
+        temperature, top_p, k = settings.to(logits.device, non_blocking=True)
         rank = torch.arange(width, device=logits.device)
         values = (values / temperature[:, None]).masked_fill(rank >= k[:, None], float("-inf"))
         probs = values.softmax(dim=-1)
@@ -87,17 +114,30 @@ class Sampler:
         # Top-p (nucleus): drop a token once the mass of the tokens ranked above it
         # already reaches p. The best token always survives.
         mass_before = probs.cumsum(dim=-1) - probs
-        probs = probs.masked_fill(mass_before >= top_p[:, None], 0.0)
+        return Candidates(probs.masked_fill(mass_before >= top_p[:, None], 0.0), indices, ks)
 
-        noise = torch.empty_like(probs).exponential_()
+    def draw(self, cand: Candidates, seqs: list[Sequence]) -> torch.Tensor:
+        """One token per row from its candidates, on the GPU: [B] token ids."""
+        if cand.probs.shape[1] == 1:
+            return cand.indices[:, 0]
+        noise = torch.empty_like(cand.probs).exponential_()
         for i, seq in enumerate(seqs):
-            if seq.params.seed is not None and seq.params.temperature > 0:
+            if (g := self.generator(seq)) is not None:
                 # Draw exactly k values so the stream doesn't depend on batch neighbours.
-                noise[i, : ks[i]].exponential_(generator=self._generator(seq))
-        choice = (probs / noise.clamp_min(1e-10)).argmax(dim=-1)  # clamp: no 0/0 = NaN
-        sampled = indices.gather(1, choice[:, None]).squeeze(1)
-        tokens = torch.where(is_greedy.bool(), indices[:, 0], sampled).tolist()
-        del settings_host  # safe now: .tolist() waited for the GPU
+                noise[i, : cand.ks[i]].exponential_(generator=g)
+        choice = (cand.probs / noise.clamp_min(1e-10)).argmax(dim=-1)  # clamp: no 0/0 = NaN
+        return cand.indices.gather(1, choice[:, None]).squeeze(1)
+
+    def sample(self, logits: torch.Tensor, seqs: list[Sequence]) -> list[int]:
+        """Choose one next token per row.
+
+        logits: [B, vocab] fp32, row i belongs to seqs[i]
+        returns B token ids (one host sync, here, per engine step)
+        """
+        if not seqs:  # a step that only advanced prompt chunks
+            return []
+        tokens = self.draw(self.candidates(logits, seqs), seqs).tolist()
+        self.synced()
         return tokens
 
 

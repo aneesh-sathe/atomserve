@@ -75,6 +75,7 @@ class EngineConfig:
     max_model_len: int = 16384  # longest sequence (prompt + output) accepted
     enable_prefix_caching: bool = True  # reuse KV blocks of identical prompt prefixes
     num_speculative_tokens: int = 0  # tokens a draft model proposes per step (0: off)
+    max_speculative_batch: int = 2  # speculate only while at most this many sequences run
 
     def __post_init__(self) -> None:
         if self.max_model_len > self.num_blocks * self.block_size:

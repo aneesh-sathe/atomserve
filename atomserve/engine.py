@@ -27,6 +27,7 @@ from atomserve.model import Weights
 from atomserve.runner import ModelRunner
 from atomserve.scheduler import Scheduler
 from atomserve.sequence import SamplingParams, Sequence, SequenceStatus
+from atomserve.speculative import SpeculativeRunner
 
 
 @dataclass
@@ -87,7 +88,7 @@ class RequestHandle:
 class Engine:
     """Accepts requests from any thread; runs them on its own thread (or via `step`)."""
 
-    def __init__(self, runner: ModelRunner, scheduler: Scheduler):
+    def __init__(self, runner: ModelRunner | SpeculativeRunner, scheduler: Scheduler):
         self.runner = runner
         self.scheduler = scheduler
         self._inbox: queue.SimpleQueue[tuple] = queue.SimpleQueue()
@@ -161,6 +162,8 @@ class Engine:
             "prompt_tokens": self.num_prompt_tokens,
             "cached_prompt_tokens": self.num_cached_prompt_tokens,
             "generated_tokens": self.num_generated_tokens,
+            "draft_tokens": getattr(self.runner, "num_drafted", 0),
+            "accepted_draft_tokens": getattr(self.runner, "num_accepted", 0),
         }
 
     # ---- engine side (engine thread only) -------------------------------------------
@@ -236,9 +239,23 @@ def create_engine(
     model_config: ModelConfig,
     engine_config: EngineConfig,
     eos_token_ids: frozenset[int],
+    draft: tuple[Weights, ModelConfig] | None = None,
 ) -> Engine:
-    """Wire up the KV pool, runner and scheduler around loaded weights (thread not started)."""
-    device, dtype = weights.embed.device, weights.embed.dtype
-    pool = KVPool(model_config, engine_config.num_blocks, engine_config.block_size, device, dtype)
-    runner = ModelRunner(weights, model_config, pool)
+    """Wire up KV pool(s), runner and scheduler around loaded weights (thread not started).
+
+    With `draft` (a smaller model of the same family) and
+    engine_config.num_speculative_tokens > 0, decoding is speculative: the draft gets
+    its own KV pool with the same number of blocks, indexed by the same block tables.
+    """
+    if (draft is not None) != (engine_config.num_speculative_tokens > 0):
+        raise ValueError("speculative decoding needs both a draft model and num_speculative_tokens")
+
+    def runner_for(w: Weights, config: ModelConfig) -> ModelRunner:
+        device, dtype = w.embed.device, w.embed.dtype
+        pool = KVPool(config, engine_config.num_blocks, engine_config.block_size, device, dtype)
+        return ModelRunner(w, config, pool)
+
+    runner = runner_for(weights, model_config)
+    if draft is not None:
+        runner = SpeculativeRunner(runner, runner_for(*draft))
     return Engine(runner, Scheduler(engine_config, eos_token_ids))

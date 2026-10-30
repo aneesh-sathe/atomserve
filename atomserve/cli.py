@@ -64,13 +64,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-prefix-caching", action="store_true", help="always recompute shared prompt prefixes"
     )
+    parser.add_argument(
+        "--draft-model",
+        help="smaller model of the same family for speculative decoding (e.g. Qwen/Qwen3-0.6B)",
+    )
+    parser.add_argument(
+        "--num-speculative-tokens",
+        type=int,
+        default=3,
+        help="tokens the draft model proposes per step (with --draft-model)",
+    )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser
 
 
-def engine_config_for(args: argparse.Namespace, model_config: ModelConfig) -> EngineConfig:
-    """Size the KV pool from the memory budget; cap sequence length by pool and model."""
-    block_bytes = KVPool.bytes_per_block(model_config, args.block_size, DTYPES[args.dtype])
+def engine_config_for(
+    args: argparse.Namespace, model_config: ModelConfig, draft_config: ModelConfig | None = None
+) -> EngineConfig:
+    """Size the KV pool(s) from the memory budget; cap sequence length by pool and model.
+
+    With a draft model, every block exists in both models' pools, so a block costs both.
+    """
+    configs = [model_config] + ([draft_config] if draft_config else [])
+    dtype = DTYPES[args.dtype]
+    block_bytes = sum(KVPool.bytes_per_block(c, args.block_size, dtype) for c in configs)
     num_blocks = int(args.kv_mem_gb * 2**30 // block_bytes)
     return EngineConfig(
         block_size=args.block_size,
@@ -79,7 +96,31 @@ def engine_config_for(args: argparse.Namespace, model_config: ModelConfig) -> En
         max_num_batched_tokens=args.max_batched_tokens,
         max_model_len=min(model_config.max_position_embeddings, num_blocks * args.block_size),
         enable_prefix_caching=not args.no_prefix_caching,
+        num_speculative_tokens=args.num_speculative_tokens if draft_config else 0,
     )
+
+
+def fit_kv_budget(args: argparse.Namespace, weights: list, device: torch.device) -> None:
+    """Shrink --kv-mem-gb if weights + KV cache would exceed the GPU's working set.
+
+    Past torch.mps.recommended_max_memory(), macOS starts paging GPU memory and
+    every step slows down severalfold, with no error. 1 GiB stays free for activations.
+    """
+    if device.type != "mps":
+        return
+    weight_bytes = sum(
+        t.numel() * t.element_size()
+        for w in weights
+        for t in {id(t): t for t in [w.embed, w.lm_head, w.final_norm, *[
+            x for layer in w.layers for x in vars(layer).values()
+        ]]}.values()
+    )  # fmt: skip
+    room_gb = (torch.mps.recommended_max_memory() - weight_bytes) / 2**30 - 1.0
+    if args.kv_mem_gb > room_gb:
+        if room_gb < 0.25:
+            raise SystemExit("atomserve: the model(s) leave no GPU memory for a KV cache.")
+        print(f"Note: KV cache reduced to {room_gb:.1f} GiB to fit in GPU memory.")
+        args.kv_mem_gb = room_gb
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -92,8 +133,20 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Loading {args.model} ({args.dtype}, {device.type}) ...", flush=True)
     weights = load_weights(model_dir, model_config, device, DTYPES[args.dtype])
     tokenizer = ChatTokenizer(model_dir)
-    engine_config = engine_config_for(args, model_config)
-    engine = create_engine(weights, model_config, engine_config, tokenizer.eos_token_ids)
+    draft = None
+    if args.draft_model:
+        draft_dir = resolve_model_dir(args.draft_model)
+        if (draft_dir / "tokenizer.json").read_bytes() != (
+            model_dir / "tokenizer.json"
+        ).read_bytes():
+            print(f"atomserve: {args.draft_model} has a different tokenizer from {args.model}.")
+            return 1
+        print(f"Loading draft model {args.draft_model} ...", flush=True)
+        draft_config = ModelConfig.load(draft_dir)
+        draft = (load_weights(draft_dir, draft_config, device, DTYPES[args.dtype]), draft_config)
+    fit_kv_budget(args, [weights] + ([draft[0]] if draft else []), device)
+    engine_config = engine_config_for(args, model_config, draft[1] if draft else None)
+    engine = create_engine(weights, model_config, engine_config, tokenizer.eos_token_ids, draft)
 
     # The first MPS run compiles kernels; pay that now rather than on the first reply.
     engine.generate([tokenizer.encode("Hello")], SamplingParams(temperature=0.0, max_tokens=2))

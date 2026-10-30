@@ -75,6 +75,7 @@ class Scheduler:
         self.allocator = BlockAllocator(config.num_blocks)
         self.waiting: deque[Sequence] = deque()
         self.running: list[Sequence] = []  # in admission order
+        self._speculate = False  # decided at the start of each schedule()
 
     def add(self, seq: Sequence) -> None:
         """Queue a new request."""
@@ -88,6 +89,9 @@ class Scheduler:
         """Pick this step's sequences and token counts, reserving their KV blocks."""
         budget = self.config.max_num_batched_tokens
         out = SchedulerOutput()
+        # Speculation pays off only while the batch is small: a big batch already
+        # shares each weight read between many sequences, so drafting is pure overhead.
+        self._speculate = len(self.running) <= self.config.max_speculative_batch
 
         # 1. Running sequences: each needs one token, plus a block when it crosses
         #    a block boundary. Iterate over a copy: preemption shrinks the list.
@@ -183,13 +187,13 @@ class Scheduler:
     def _lookahead(self, seq: Sequence, n: int, budget: int) -> int:
         """Speculative tokens to reserve for `seq` this step (0 when not speculating).
 
-        Only decodes speculate, and never past the sequence's limits or the step's
-        token budget. A presence penalty depends on every token generated before
-        each position, which drafted tokens would change; those requests don't
-        speculate.
+        Only decodes speculate, only while the batch is small (max_speculative_batch),
+        and never past the sequence's limits or the step's token budget. A presence
+        penalty depends on every token generated before each position, which drafted
+        tokens would change; those requests don't speculate.
         """
         k = self.config.num_speculative_tokens
-        if k == 0 or n != 1 or seq.num_tokens - seq.num_computed_tokens != 1:
+        if k == 0 or not self._speculate or n != 1 or seq.num_tokens - seq.num_computed_tokens != 1:
             return 0
         if seq.params.presence_penalty != 0:
             return 0
