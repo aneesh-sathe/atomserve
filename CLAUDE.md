@@ -4,8 +4,10 @@ Minimal, learning-focused LLM inference engine for Apple silicon (PyTorch MPS).
 Full spec and milestones: `~/.claude/plans/i-want-to-build-tidy-stream.md`.
 
 ## Decisions
-- Single model family: Qwen3 (`Qwen3ForCausalLM`), developed against `Qwen/Qwen3-0.6B`; 1.7B (fp32) and
-  4B (bf16) verified against transformers too. Fail fast on anything else.
+- Single model family: Qwen3 (`Qwen3ForCausalLM`), developed against `Qwen/Qwen3-0.6B`; 1.7B (fp32),
+  4B and 8B (bf16, 8B also int8) verified against transformers too. Fail fast on anything else.
+  Big-model reference checks: run transformers in its own process (CPU, bf16) and save logits first;
+  8B bf16 needs 16 GB of RAM for the reference, and our bf16 8B only fits with a tiny KV pool.
 - Chat only, no tool calling.
 - Plain tensors and functions; `transformers` is a dev dependency for golden tests only, never imported by `atomserve/`.
 - One process: engine thread + chat REPL + OpenAI-compatible HTTP (stdlib `http.server`). No asyncio.
@@ -82,6 +84,8 @@ Full spec and milestones: `~/.claude/plans/i-want-to-build-tidy-stream.md`.
   `tests/test_repl.py` spawns via subprocess + `TIOCSCTTY`. Pause ~0.3 s after the prompt before
   typing, and never wait on the child without a timeout. Keep reading the pty while waiting for
   exit: macOS blocks a process's exit until its unread terminal output drains.
+- Qwen3-8B (untied lm_head) on this machine: bf16 15.7 tok/s at batch 1 (KV cut to 1.5 GiB),
+  int8 29.0, int8 + 0.6B draft k=2 43.8. A 1.7B draft is accepted more (75-85%) but is no faster.
 - Speculative decoding (4B target, 0.6B draft, batch 1, chat text): 28 -> 45 tok/s bf16, 64 tok/s with
   int8 for both; k=2-3 best; loses from batch 4 up (verification rows hit MPS's M>8 matmul cost),
   hence max_speculative_batch=2. Greedy spec == target alone is tested (tiny models + 1.7B/0.6B fp32).
@@ -92,6 +96,10 @@ Full spec and milestones: `~/.claude/plans/i-want-to-build-tidy-stream.md`.
   temporaries hit the memory limit (4B batch 32 went to 525 ms/step); use kernels.dequantize_int8.
 - `torch.mps.recommended_max_memory()` is 17.8 GiB on this 24 GB machine. Exceeding it (weights + KV)
   pages GPU memory: every step slows ~2x with no error. cli.fit_kv_budget shrinks the KV cache.
+- The loader streams tensors from memory-mapped shards (safe_open) and quantizes each projection as it
+  arrives: CPU and GPU share memory, so reading whole shards first held the checkpoint twice. Then
+  `torch.mps.empty_cache()`: the MPS allocator keeps freed buffers cached (4B int8 load: 16.1 GiB of GPU
+  memory with the old loader, 7.0 GiB now, for 4.5 GiB of weights).
 - A Hub cache entry can be partial (e.g. only config.json fetched by another tool); `snapshot_download
   (local_files_only=True)` still returns it. loader.missing_files checks before trusting it.
 - Python reads `coding[:=]` in a file's first two lines as an encoding declaration: a header comment like

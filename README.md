@@ -20,9 +20,10 @@ There are no frameworks hiding them: about 2,900 lines of code across 18 files (
 Metal kernels), one concept per file. Every file opens with a comment explaining its concept;
 every function documents its tensor shapes and the non-obvious "why".
 
-- **Models:** Qwen3 (`Qwen3ForCausalLM`). Qwen3-0.6B, 1.7B and 4B have been verified against
+- **Models:** Qwen3 (`Qwen3ForCausalLM`). Qwen3-0.6B, 1.7B, 4B and 8B have been verified against
   Hugging Face `transformers`; larger Qwen3 checkpoints share the architecture. Other
-  architectures are rejected at load time.
+  architectures are rejected at load time. On a 24 GB Mac, 8B runs in bf16 with a reduced KV
+  cache (about 11k tokens), or comfortably with `--quantize int8`.
 - **Scope:** chat and text completion. No tool calling, no multimodal input, one model per process.
 
 ## Quickstart
@@ -120,8 +121,13 @@ aborted and its KV blocks freed.
 The fastest single-user setup for a bigger model combines both:
 
 ```sh
-uv run atomserve Qwen/Qwen3-4B --quantize int8 --draft-model Qwen/Qwen3-0.6B
+uv run atomserve Qwen/Qwen3-8B --quantize int8 --draft-model Qwen/Qwen3-0.6B
 ```
+
+Weights load one tensor at a time from memory-mapped shards and are quantized as they arrive.
+On Apple silicon CPU and GPU share memory, so reading whole shards first would hold the
+checkpoint twice. Streaming lets 8B load as 8 GB of int8 without ever holding its 16 GB bf16
+form.
 
 If weights plus KV cache would exceed the GPU's working set
 (`torch.mps.recommended_max_memory()`), the KV cache is shrunk to fit and a note is printed.
@@ -394,12 +400,16 @@ Prefill is compute-bound: matmuls and attention both run at about 5 TFLOPS, roug
 **Bigger models, quantization and speculative decoding** (`bench/engine.py --chat`, batch 1,
 128 tokens of a real chat reply):
 
-| | Qwen3-0.6B | Qwen3-4B |
-|---|---|---|
-| bf16 | 133 tok/s | 28 tok/s |
-| int8 | 184 tok/s | 50 tok/s |
-| bf16 + 0.6B draft (k=3) | | 45 tok/s (58% of drafts accepted) |
-| int8 + int8 0.6B draft (k=3) | | 64 tok/s |
+| | Qwen3-0.6B | Qwen3-4B | Qwen3-8B |
+|---|---|---|---|
+| bf16 | 133 tok/s | 28 tok/s | 16 tok/s |
+| int8 | 184 tok/s | 50 tok/s | 29 tok/s |
+| bf16 + 0.6B draft (k=3) | | 45 tok/s (58% of drafts accepted) | |
+| int8 + int8 0.6B draft | | 64 tok/s (k=3) | 44 tok/s (k=2) |
+
+For 8B, the 1.7B draft is accepted more often (75 to 85% vs about 62%) but costs more per
+step, so it ends up about even with 0.6B. On natural text, 8B int8 has perplexity 8.36
+against 8.37 for `transformers` bf16.
 
 At batch 4, int8 is 1.16× (0.6B) and 1.38× (4B) faster than bf16; at batch 8 they are even.
 Speculation pays at batch 1 (1.6×) and 2 (1.1×), which is why it switches off above 2.

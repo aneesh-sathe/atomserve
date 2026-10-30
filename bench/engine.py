@@ -49,14 +49,16 @@ CHAT_QUESTIONS = [
 ]
 
 
-def make_engine(weights, config, draft=None, num_speculative_tokens: int = 0) -> Engine:
+def make_engine(
+    weights, config, draft=None, num_speculative_tokens: int = 0, kv_mem_gb: float = 4.0
+) -> Engine:
     """One engine for every scenario, as in a server: a fresh KV pool would make the
     first run pay for touching new GPU memory. Prefix caching is off so repeated runs
-    stay cold. The pools get 4 GiB in total (shared with the draft model's), like the
-    CLI's default: more would push big models past the GPU's working-set limit."""
+    stay cold. The pools get kv_mem_gb in total (shared with the draft model's), like
+    the CLI: more would push big models past the GPU's working-set limit."""
     configs = [config] + ([draft[1]] if draft else [])
     block_bytes = sum(KVPool.bytes_per_block(c, 16, torch.bfloat16) for c in configs)
-    num_blocks = 4 * 2**30 // block_bytes
+    num_blocks = int(kv_mem_gb * 2**30 // block_bytes)
     engine_config = EngineConfig(
         num_blocks=num_blocks,
         max_model_len=min(16384, num_blocks * 16),
@@ -175,6 +177,7 @@ def main() -> None:
     parser.add_argument("--draft-model", help="speculative decoding with this draft model")
     parser.add_argument("--num-speculative-tokens", type=int, default=3)
     parser.add_argument("--quantize", choices=["int8"], help="int8 weights (target and draft)")
+    parser.add_argument("--kv-mem-gb", type=float, default=4.0, help="KV cache, all pools")
     args = parser.parse_args()
 
     def load(model_dir, config):
@@ -189,10 +192,11 @@ def main() -> None:
         draft_config = ModelConfig.load(draft_dir)
         draft = (load(draft_dir, draft_config), draft_config)
         k = args.num_speculative_tokens
-    engine = make_engine(weights, config, draft, k)
+    engine = make_engine(weights, config, draft, k, args.kv_mem_gb)
     bench_decode(engine, 2, 8)  # warm-up: compile MPS kernels, touch the KV pool
+    longest = engine.scheduler.config.max_model_len - 1
     for length in (600, 8000):
-        bench_prefill(engine, length)
+        bench_prefill(engine, min(length, longest))
 
     for batch in [int(b) for b in args.batch.split(",")]:
         before = engine.stats()
