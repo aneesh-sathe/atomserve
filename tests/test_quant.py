@@ -67,3 +67,20 @@ def test_int8_keeps_real_model_quality(model_dir, config, weights_bf16, full_log
 
     assert perplexity(quant) == pytest.approx(perplexity(ref), rel=0.03)
     assert (quant.argmax(-1) == ref.argmax(-1)).float().mean() > 0.9
+
+
+def test_untied_int8_lm_head_alone_serves_small_and_big_batches():
+    """An untied model keeps only the int8 lm_head; few rows and many rows (dequantized in
+    slices) both compute hidden @ dequantize(lm_head)^T."""
+    import dataclasses
+
+    from atomserve.model import compute_logits
+
+    weights = random_weights(TINY_CONFIG)
+    weights = dataclasses.replace(weights, lm_head=torch.randn(TINY_CONFIG.vocab_size, 32))
+    quantize_weights(weights, tied=False)
+    assert weights.lm_head is None
+    head = weights.lm_head_int8.dequantize()
+    for rows in (3, 40):
+        hidden = torch.randn(rows, 32)
+        assert torch.allclose(compute_logits(weights, hidden), hidden @ head.T, atol=1e-5)

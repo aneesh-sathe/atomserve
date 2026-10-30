@@ -5,14 +5,15 @@
 # into the `Weights` structure that model.py computes with.
 
 import json
+from contextlib import ExitStack
 from pathlib import Path
 
 import torch
 from huggingface_hub import snapshot_download
-from safetensors.torch import load_file
+from safetensors import safe_open
 
 from atomserve.config import ModelConfig
-from atomserve.model import LayerWeights, Weights
+from atomserve.model import LayerWeights, Linear, Weights
 from atomserve.quant import quantize_int8
 
 # Config, tokenizer and weight files. Skips README, images, etc.
@@ -66,75 +67,97 @@ def load_weights(
     dtype: torch.dtype,
     quantize: str | None = None,
 ) -> Weights:
-    """Read every `*.safetensors` shard and build `Weights` on `device` in `dtype`.
+    """Read the `*.safetensors` shards and build `Weights` on `device` in `dtype`.
 
     Checkpoint names look like `model.layers.3.self_attn.q_proj.weight`; this is
     the only place that knows them. q/k/v and gate/up are stacked here into one
-    matrix each. Tensors are loaded on CPU, then cast and moved
-    one at a time so peak memory stays near one model's worth.
+    matrix each.
+
+    Tensors are read one at a time from memory-mapped shards, moved to the device
+    and, with quantize="int8", quantized right away (see quant.py). On Apple
+    silicon CPU and GPU share memory, so reading whole shards first would hold
+    the checkpoint twice; streaming keeps the peak near the final model plus one
+    matrix. That is what lets Qwen3-8B load as 8 GB of int8 on a 24 GB machine,
+    without ever holding its 16 GB bf16 form.
     """
-    raw: dict[str, torch.Tensor] = {}
-    for shard in sorted(model_dir.glob("*.safetensors")):
-        raw.update(load_file(shard, device="cpu"))
-    if not raw:
+    if quantize not in (None, "int8"):
+        raise ValueError(f"unknown quantization {quantize!r}")
+    shards = sorted(model_dir.glob("*.safetensors"))
+    if not shards:
         raise FileNotFoundError(f"no *.safetensors files in {model_dir}")
 
-    def take(name: str) -> torch.Tensor:
-        return raw.pop(name).to(device=device, dtype=dtype)
+    with ExitStack() as stack:
+        files = [stack.enter_context(safe_open(s, framework="pt", device="cpu")) for s in shards]
+        where = {name: f for f in files for name in f.keys()}  # noqa: SIM118 (safe_open isn't a dict)
+        unused = set(where)
 
-    def stack(*names: str) -> torch.Tensor:
-        """Concatenate projection matrices along their output rows (see LayerWeights)."""
-        return torch.cat([raw.pop(n) for n in names]).to(device=device, dtype=dtype)
+        def read(name: str) -> torch.Tensor:
+            unused.discard(name)
+            return where[name].get_tensor(name)
 
-    layers = []
-    for i in range(config.num_layers):
-        p = f"model.layers.{i}."
-        layers.append(
-            LayerWeights(
-                input_norm=take(p + "input_layernorm.weight"),
-                qkv_proj=stack(
-                    p + "self_attn.q_proj.weight",
-                    p + "self_attn.k_proj.weight",
-                    p + "self_attn.v_proj.weight",
-                ),
-                q_norm=take(p + "self_attn.q_norm.weight"),
-                k_norm=take(p + "self_attn.k_norm.weight"),
-                o_proj=take(p + "self_attn.o_proj.weight"),
-                post_attn_norm=take(p + "post_attention_layernorm.weight"),
-                gate_up_proj=stack(p + "mlp.gate_proj.weight", p + "mlp.up_proj.weight"),
-                down_proj=take(p + "mlp.down_proj.weight"),
+        def take(name: str) -> torch.Tensor:
+            return read(name).to(device=device, dtype=dtype)
+
+        def matrix(*names: str) -> Linear:
+            """A projection: several checkpoint matrices stacked along their output rows."""
+            w = torch.cat([read(n) for n in names]).to(device=device, dtype=dtype)
+            return quantize_int8(w) if quantize else w
+
+        layers = []
+        for i in range(config.num_layers):
+            p = f"model.layers.{i}."
+            layers.append(
+                LayerWeights(
+                    input_norm=take(p + "input_layernorm.weight"),
+                    qkv_proj=matrix(
+                        p + "self_attn.q_proj.weight",
+                        p + "self_attn.k_proj.weight",
+                        p + "self_attn.v_proj.weight",
+                    ),
+                    q_norm=take(p + "self_attn.q_norm.weight"),
+                    k_norm=take(p + "self_attn.k_norm.weight"),
+                    o_proj=matrix(p + "self_attn.o_proj.weight"),
+                    post_attn_norm=take(p + "post_attention_layernorm.weight"),
+                    gate_up_proj=matrix(p + "mlp.gate_proj.weight", p + "mlp.up_proj.weight"),
+                    down_proj=matrix(p + "mlp.down_proj.weight"),
+                )
             )
+        weights = Weights(
+            embed=take("model.embed_tokens.weight"),
+            layers=layers,
+            final_norm=take("model.norm.weight"),
+            lm_head=None,
         )
+        # Tied models may still ship an lm_head copy; the config decides which is used.
+        unused.discard("lm_head.weight")
+        if config.tie_word_embeddings:
+            weights.lm_head = weights.embed
+        elif "lm_head.weight" in where:
+            weights.lm_head = take("lm_head.weight")
+        else:
+            raise KeyError("lm_head.weight missing and tie_word_embeddings is False")
+        if unused:
+            raise KeyError(f"unexpected tensors in checkpoint: {sorted(unused)[:5]} ...")
 
-    embed = take("model.embed_tokens.weight")
-    final_norm = take("model.norm.weight")
-    # Tied models may still ship an lm_head copy; the config decides which is used.
-    lm_head_raw = raw.pop("lm_head.weight", None)
-    if config.tie_word_embeddings:
-        lm_head = embed
-    elif lm_head_raw is not None:
-        lm_head = lm_head_raw.to(device=device, dtype=dtype)
-    else:
-        raise KeyError("lm_head.weight missing and tie_word_embeddings is False")
-
-    if raw:
-        raise KeyError(f"unexpected tensors in checkpoint: {sorted(raw)[:5]} ...")
-    weights = Weights(embed=embed, layers=layers, final_norm=final_norm, lm_head=lm_head)
-    if quantize == "int8":
-        quantize_weights(weights)
-    elif quantize is not None:
-        raise ValueError(f"unknown quantization {quantize!r}")
+    if quantize:
+        quantize_lm_head(weights, tied=config.tie_word_embeddings)
     return weights
 
 
-def quantize_weights(weights: Weights) -> None:
-    """Replace every layer's projection matrices by int8 versions, in place (see quant.py).
+def quantize_lm_head(weights: Weights, tied: bool) -> None:
+    """Give the lm_head an int8 copy for small batches (see model.compute_logits).
 
-    One matrix at a time, so memory peaks at the bf16 model plus one matrix. The
-    lm_head gets an int8 copy for small batches; the bf16 one stays, as it is
-    the embedding too when tied.
+    A tied lm_head is the embedding too, so its bf16 matrix stays; an untied one
+    (1.2 GB in Qwen3-8B) is replaced, and big batches dequantize it in slices.
     """
+    weights.lm_head_int8 = quantize_int8(weights.lm_head)
+    if not tied:
+        weights.lm_head = None
+
+
+def quantize_weights(weights: Weights, tied: bool = True) -> None:
+    """Quantize an already loaded model in place (load_weights(quantize="int8") streams instead)."""
     for layer in weights.layers:
         for name in ("qkv_proj", "o_proj", "gate_up_proj", "down_proj"):
             setattr(layer, name, quantize_int8(getattr(layer, name)))
-    weights.lm_head_int8 = quantize_int8(weights.lm_head)
+    quantize_lm_head(weights, tied)

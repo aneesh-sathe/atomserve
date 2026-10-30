@@ -54,13 +54,14 @@ class Weights:
     embed: torch.Tensor  # [vocab, hidden]  token id -> vector
     layers: list[LayerWeights]
     final_norm: torch.Tensor  # [hidden]
-    lm_head: torch.Tensor  # [vocab, hidden]  same tensor as `embed` when tied
-    lm_head_int8: Int8Weight | None = None  # quantized copy for small batches (--quantize)
+    lm_head: torch.Tensor | None  # [vocab, hidden]  same tensor as `embed` when tied
+    lm_head_int8: Int8Weight | None = None  # with --quantize (an untied model keeps only this)
 
     @property
     def nbytes(self) -> int:
         """Memory of all distinct parameter tensors (a tied lm_head counts once)."""
-        tensors = {id(t): t for t in (self.embed, self.final_norm, self.lm_head)}
+        plain_heads = [self.lm_head] if self.lm_head is not None else []
+        tensors = {id(t): t for t in (self.embed, self.final_norm, *plain_heads)}
         quantized = [self.lm_head_int8] if self.lm_head_int8 else []
         for layer in self.layers:
             for t in vars(layer).values():
@@ -388,10 +389,13 @@ def compute_logits(
     keeps anyway for the embedding lookup.
     """
     small = hidden.shape[0] <= kernels.INT8_MAX_ROWS
-    if weights.lm_head_int8 is not None and small:
-        return linear(hidden, weights.lm_head_int8, use_kernels=use_kernels).float()
-    slices = weights.lm_head.split(LM_HEAD_SLICE)
-    return torch.cat([F.linear(hidden, w) for w in slices], dim=-1).float()
+    if weights.lm_head_int8 is not None and (small or weights.lm_head is None):
+        # Unsliced for few rows (the int8 kernel has no wide-matmul cliff); in slices
+        # for many, so each dequantized temporary stays small.
+        heads = [weights.lm_head_int8] if small else weights.lm_head_int8.split(LM_HEAD_SLICE)
+    else:
+        heads = weights.lm_head.split(LM_HEAD_SLICE)
+    return torch.cat([linear(hidden, w, use_kernels=use_kernels) for w in heads], dim=-1).float()
 
 
 LM_HEAD_SLICE = 32768

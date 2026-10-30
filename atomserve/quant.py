@@ -41,6 +41,13 @@ class Int8Weight:
         """Back to a regular [N, K] matrix in `dtype` (an approximation of the original)."""
         return (self.q.to(torch.float32) * self.scale[:, None]).to(self.dtype)
 
+    def split(self, rows: int) -> list[Int8Weight]:
+        """Consecutive slices of at most `rows` output rows each (views, no copy)."""
+        return [
+            Int8Weight(q, s, self.dtype)
+            for q, s in zip(self.q.split(rows), self.scale.split(rows), strict=True)
+        ]
+
     @property
     def nbytes(self) -> int:
         return self.q.numel() + self.scale.numel() * self.scale.element_size()
