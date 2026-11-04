@@ -14,9 +14,10 @@ all here:
 - batched sampling
 - speculative decoding with a draft model
 - int8 weight quantization
+- int8 KV cache
 - hand-written Metal kernels for the hot paths
 
-There are no frameworks hiding them: about 2,900 lines of code across 18 files (including seven
+There are no frameworks hiding them: about 3,150 lines of code across 18 files (including eight
 Metal kernels), one concept per file. Every file opens with a comment explaining its concept;
 every function documents its tensor shapes and the non-obvious "why".
 
@@ -108,8 +109,9 @@ aborted and its KV blocks freed.
 |---|---|---|
 | `--host`, `--port` | `127.0.0.1`, `11435` | HTTP API address. |
 | `--no-repl` | off | Serve the API only, logging requests. |
-| `--dtype` | `bf16` | Weights and KV cache dtype (`bf16` or `fp32`). |
+| `--dtype` | `bf16` | Weights, activations and (by default) KV cache dtype (`bf16` or `fp32`). |
 | `--kv-mem-gb` | `4` | GiB reserved for the KV cache; sets the pool's block count and the longest context. |
+| `--kv-dtype` | `auto` | `int8` stores the KV cache as int8: about 2× the context in the same memory. |
 | `--block-size` | `16` | Tokens per KV block. |
 | `--max-num-seqs` | `32` | Most requests running at once. |
 | `--max-batched-tokens` | `512` | Token budget of one forward pass (see chunked prefill). |
@@ -173,10 +175,10 @@ Dependencies flow one way, top to bottom.
 | `runner.py` | Flattens a scheduler plan into GPU tensors (the `Batch`), runs the model, samples. |
 | `sampler.py` | Batched sampling: presence penalty, temperature, top-k, top-p, seeded draws. |
 | `model.py` | The Qwen3 transformer as plain functions over a flat batch: RMSNorm, RoPE, GQA, paged attention, SwiGLU. The readable reference; also the CPU path. |
-| `kernels.py` | Metal kernels for the hot spots: fused q/k-norm + RoPE + KV write, paged decode attention, top-k, SiLU·mul, int8 matmul. |
+| `kernels.py` | Metal kernels for the hot spots: fused q/k-norm + RoPE + KV write, paged decode attention, top-k, SiLU·mul, int8 matmul, int8 KV gather. |
 | `speculative.py` | Speculative decoding: draft proposals, one-pass verification by the target, rejection sampling. |
 | `quant.py` | int8 weight quantization: per-row scales, and the matmul that picks a kernel by batch size. |
-| `kv_cache.py` | The paged KV pool tensors: slot scatter (write) and gather (read). |
+| `kv_cache.py` | The paged KV pool tensors: slot scatter (write) and gather (read); int8 storage with rotated keys. |
 | `loader.py` | Hub download (offline when cached) and the safetensors-to-`Weights` mapping. |
 | `config.py` | `ModelConfig` (validated `config.json`) and `EngineConfig` (serving limits). |
 
@@ -239,7 +241,9 @@ check that the whole engine produces identical tokens with kernels on and off.
 - **`qk_norm_rope_store`:** one launch per layer, replacing about 16. Thread i of a head's
   64-thread group owns the RoPE pair (i, i + 64). It RMS-normalizes q and k heads (a simdgroup
   reduction), rotates them by position with precise trig, writes q out and writes k and v
-  straight into their pool slots.
+  straight into their pool slots. For an int8 pool it also applies the Hadamard rotation (a
+  fast Walsh-Hadamard transform: one butterfly in registers, one through threadgroup memory,
+  five by simd shuffles) and quantizes each head.
 - **`paged_decode_attention`:** the PagedAttention "v2" scheme.
   - Pass 1 runs one threadgroup per (KV head, sequence, 512-key partition) and serves all query
     heads of the GQA group, so each K/V row is read once.
@@ -247,6 +251,8 @@ check that the whole engine produces identical tokens with kernels on and off.
     online softmax and accumulates V, with each lane owning 4 dims.
   - Pass 2 merges the partitions. With a single partition, pass 1 writes the output itself.
   - It reaches 200 to 234 GB/s on K/V and is 2 to 3× faster than gathering K/V and calling SDPA.
+  - On an int8 pool, each key's scale multiplies its score and each value's scale its softmax
+    weight: two multiplies per key, no dequantized copy.
 - **`topk_rows`:** the sampler's top-k over the 151,936-entry vocabulary.
   - A threshold first: tau is the k-th largest of the 1,024 threads' maxima. Those k maxima are
     distinct entries ≥ tau, so the row's whole top k is ≥ tau.
@@ -255,6 +261,8 @@ check that the whole engine produces identical tokens with kernels on and off.
   - It is 4× faster than `torch.topk` on MPS at batch 1 and 22× faster at batch 32.
 - **`silu_mul`:** SwiGLU's `silu(gate) * up` in one pass.
 - **`int8_linear`:** the int8 weight-only matmul for 1 to 8 activation rows (see below).
+- **`gather_dequantize_kv`:** a sequence's keys or values out of an int8 pool, as bf16, for
+  prefill attention (see the int8 KV cache).
 
 bf16 matmuls and prefill attention stay with PyTorch/MPS, which already run them at 65 to 95%
 of the hardware's limits.
@@ -336,8 +344,8 @@ accept:  d1 kept, d2 kept, d3 rejected         -> d1 d2 + a fix drawn from p3
 ### int8 weight quantization
 
 `--quantize int8` stores every projection matrix as int8 with one scale per output row:
-`scale = max|W[n, :]| / 127`, `W_q = round(W / scale)`. Activations, norms, attention and the
-KV cache stay bf16. On natural text, perplexity stays within about 1% of bf16 and the top
+`scale = max|W[n, :]| / 127`, `W_q = round(W / scale)`. Activations, norms and attention stay
+bf16, and so does the KV cache unless `--kv-dtype int8` is set (see below). On natural text, perplexity stays within about 1% of bf16 and the top
 token matches at 94 to 97% of positions (0.6B, 1.7B, 4B).
 
 The matmul dequantizes on the fly and picks its path by the number of activation rows M:
@@ -354,6 +362,36 @@ The matmul dequantizes on the fly and picks its path by the number of activation
 The tied lm_head keeps its bf16 matrix, which the embedding needs anyway, for large batches,
 plus an int8 copy for small ones. int8 is a small-batch mode: at batch 32, decode runs at 0.6
 to 0.75× of bf16, because this simple kernel doesn't use the GPU's matrix units.
+
+### int8 KV cache
+
+`--kv-dtype int8` stores each cached 128-value key or value head as int8 plus one fp32 scale,
+`max|x| / 127`: 132 bytes instead of 256. The pool holds 1.94× the tokens in the same memory
+(8B at the default 4 GiB: 29,120 tokens in bf16, 56,480 in int8), and decode attention, which
+reads the whole cache every step, moves half the bytes. Each head is quantized on its own, so
+chunking, preemption and prefix reuse store exactly the same integers.
+
+- **Keys are stored rotated.** A few key channels are always much larger than the rest, so one
+  scale per vector leaves the others with a coarse step: plain int8 keys raised Qwen3-0.6B's
+  perplexity by 5% (values were fine). Multiplying q and k by a 128 × 128 Hadamard matrix H
+  (orthonormal, entries ±1/√128) spreads every channel over all 128, and attention is
+  unchanged because (Hq)·(Hk) = q·k (the QuaRot idea). `qk_norm_rope_store` applies H to q and
+  k with a fast Walsh-Hadamard transform in registers, then quantizes.
+- **Decode attention dequantizes for free.** A key's scale multiplies its score and a value's
+  scale its softmax weight: two multiplies per key. Prefill attention gathers and dequantizes
+  a sequence's K/V in one kernel (`gather_dequantize_kv`), so prefill is as fast as with bf16.
+
+Quality against a bf16 cache, on the same natural text (mean KL divergence of the next-token
+distributions; perplexity; how often the top token agrees):
+
+| | KL | Perplexity (bf16 cache → int8) | Top-1 agrees |
+|---|---|---|---|
+| Qwen3-0.6B | 0.002 | 17.00 → 17.05 | 100% |
+| Qwen3-1.7B | 0.002 | 12.72 → 12.69 | 94% |
+| Qwen3-4B | 0.001 | 14.05 → 13.97 | 99% |
+| Qwen3-8B (int8 weights) | 0.001 | 8.01 → 8.06 | 98% |
+
+Without the rotation, 0.6B's KL is 0.026, 13× higher.
 
 ### Sampling, templates, streaming
 
@@ -412,6 +450,21 @@ step, so it ends up about even with 0.6B. On natural text, 8B int8 has perplexit
 against 8.37 for `transformers` bf16.
 
 At batch 4, int8 is 1.16× (0.6B) and 1.38× (4B) faster than bf16; at batch 8 they are even.
+
+**int8 KV cache** (Qwen3-0.6B, back to back against the bf16 cache):
+
+| | bf16 cache | int8 cache |
+|---|---|---|
+| Decode, 4,000-token context, batch 8 | 313 tok/s | 392 to 411 tok/s |
+| Decode, 4,000-token context, batch 1 | 104 tok/s | 110 tok/s |
+| Decode, 100-token context, batch 32 | 1,900 to 2,030 tok/s | 2,125 tok/s |
+| Prefill, 8,000 tokens | 3,090 ms | 3,066 ms |
+
+The gain grows with the share of each step spent reading the cache: long contexts, many
+sequences. At Qwen3-8B's shapes the decode attention kernel alone takes 215 to 230 µs instead
+of 290 to 315 µs (4 × 4,000 or 1 × 16,000 keys), 1.4× faster; the ideal would be 1.9×. That
+kernel reads a bf16 cache at 200 to 230 GB/s but an int8 one at about 150 GB/s, where the
+per-key arithmetic, not memory, sets the pace.
 Speculation pays at batch 1 (1.6×) and 2 (1.1×), which is why it switches off above 2.
 
 **HTTP** (`bench/load.py`: streaming chat, 128 output tokens per request):
@@ -519,5 +572,7 @@ The tests prove behavior; they don't just exercise code paths:
 - **An int8 matmul on the GPU's matrix units** (`simdgroup_matrix`), so int8 also wins at large
   batches.
 - **int4 weights** (group-wise scales), for models that don't fit in bf16 or int8.
+- **A faster int8 decode attention kernel.** It is 1.4× faster than bf16, not the 1.9× the
+  halved bytes allow: per-key arithmetic (conversions, shuffles, softmax) now sets its pace.
 - **Overlapping step N+1's scheduling with step N's GPU work.** The GPU idles only ~0.3 ms per
   step now, so this is a small win.

@@ -94,6 +94,14 @@ Full spec and milestones: `~/.claude/plans/i-want-to-build-tidy-stream.md`.
   M or the accumulators spill (it was 2x slower). `torch._weight_int8pack_mm` on MPS was only fast for
   one row of a big matrix. Never dequantize through fp32 (`q.float() * scale`) for big models: the
   temporaries hit the memory limit (4B batch 32 went to 525 ms/step); use kernels.dequantize_int8.
+- int8 KV cache (`--kv-dtype int8`, kv_cache.py): one fp32 scale per (token, kv head). Plain per-head
+  int8 *keys* cost Qwen3-0.6B +5% perplexity (outlier channels; values were fine; per-16-value
+  groups still +2%). Rotating q and k by a 128x128 Hadamard matrix fixes it: KL vs bf16 cache
+  ~0.001-0.002 on 0.6B-8B. Judge KV/weight quantization by KL + top-1 vs the unquantized run,
+  not perplexity alone: on 153 tokens, plain int8 keys *lowered* 8B's perplexity 6% while agreeing less.
+  Decode attention on int8: 4-byte-per-lane V loads (one key per pass) were latency-bound; two keys
+  per pass fixed most of it, four was 1.8x slower (registers). Now 1.4x faster than bf16 (ideal 1.9x).
+  Prefill had to get a fused gather+dequantize kernel: the PyTorch dequantize made 8k prefill 16% slower.
 - `torch.mps.recommended_max_memory()` is 17.8 GiB on this 24 GB machine. Exceeding it (weights + KV)
   pages GPU memory: every step slows ~2x with no error. cli.fit_kv_budget shrinks the KV cache.
 - The loader streams tensors from memory-mapped shards (safe_open) and quantizes each projection as it
@@ -105,6 +113,9 @@ Full spec and milestones: `~/.claude/plans/i-want-to-build-tidy-stream.md`.
 - Python reads `coding[:=]` in a file's first two lines as an encoding declaration: a header comment like
   "# Speculative decoding: a ..." is a SyntaxError ("unknown encoding: a"). Ruff doesn't catch it.
 - Benchmarks must count tokens, not steps (a speculative step yields several).
+- Other apps (browsers) can hold several GB: an 8B int8 bench with a 6 GiB KV pool swapped (wired memory
+  ~17 GB, 0.4% CPU, stuck for 30 min) though it was under recommended_max_memory. Check
+  `memory_pressure` first and keep KV budgets modest (3 GiB fits 4 x 4k or 1 x 16k for 8B).
 - Qwen3-0.6B sometimes loops forever while thinking on trick prompts; that is the model, not the engine.
 - Importing `transformers` prints a harmless torch.distributed "Redirects" warning on macOS; the engine never imports it.
 
