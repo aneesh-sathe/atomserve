@@ -46,6 +46,9 @@ def test_kv_pool_is_sized_from_the_memory_budget():
     assert config.max_model_len == 2340 * 16
     small = engine_config_for(build_parser().parse_args(["m", "--kv-mem-gb", "1"]), qwen3_06b)
     assert small.max_model_len == small.num_blocks * 16 < 40960
+    # int8: 28 * 2 * 8 * (128 + 4) * 16 bytes = 0.90 MiB per block, so 4539 blocks.
+    int8 = engine_config_for(build_parser().parse_args(["m", "--kv-dtype", "int8"]), qwen3_06b)
+    assert int8.num_blocks == 4539 and int8.kv_dtype == "int8"
 
 
 def test_missing_files_detects_a_partial_model_directory(tmp_path):

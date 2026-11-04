@@ -185,6 +185,17 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     return x * cos[:, None, :] + rotated * sin[:, None, :]
 
 
+def rotate(x: torch.Tensor, rotation: torch.Tensor) -> torch.Tensor:
+    """Multiply every head vector by an orthogonal matrix (computed in fp32).
+
+    x: [T, H, head_dim]  rotation: [head_dim, head_dim] fp32  ->  [T, H, head_dim] in x's dtype
+
+    Rotating queries and keys by the same orthogonal matrix leaves every q . k,
+    and therefore attention, unchanged; kv_cache.py says why int8 keys want it.
+    """
+    return (x.float() @ rotation).to(x.dtype)
+
+
 def attention(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, q_positions: torch.Tensor
 ) -> torch.Tensor:
@@ -233,11 +244,11 @@ def paged_attention(q: torch.Tensor, pool: KVPool, layer_idx: int, batch: Batch)
     """
     if batch.decode_rows is not None:
         q_dec = q if not batch.prefills else q.index_select(0, batch.decode_rows)
-        k_slots, v_slots = pool.layer_slots(layer_idx)
         if batch.use_kernels:
+            s = pool.layer_slots(layer_idx)
             decoded = kernels.paged_decode_attention(
-                q_dec, k_slots, v_slots, batch.decode_block_tables, batch.decode_lens,
-                pool.block_size, k_slots.shape[1], batch.decode_max_len,
+                q_dec, s.k, s.v, batch.decode_block_tables, batch.decode_lens,
+                pool.block_size, s.k.shape[1], batch.decode_max_len, s.k_scale, s.v_scale,
             )  # fmt: skip
         else:
             Bd, L = batch.decode_slots.shape
@@ -248,7 +259,7 @@ def paged_attention(q: torch.Tensor, pool: KVPool, layer_idx: int, batch: Batch)
             return decoded
     out = torch.empty_like(q)
     for span in batch.prefills:
-        k, v = pool.read(layer_idx, span.context_slots)  # [context_len, num_kv_heads, head_dim]
+        k, v = pool.read(layer_idx, span.context_slots, batch.use_kernels)  # [context, kv, D]
         out[span.rows] = attention(q[span.rows], k, v, batch.positions[span.rows])
     if batch.decode_rows is not None:
         out.index_copy_(0, batch.decode_rows, decoded)
@@ -299,16 +310,17 @@ def attention_block(
     Llama: keeps attention logits well-scaled), rotate q and k by position,
     store the new k/v in the pool, attend, then mix the heads back to the
     hidden size with o_proj. Writing before attending means each new token sees
-    its own key, and past tokens are never re-projected.
+    its own key, and past tokens are never re-projected. With an int8 pool, q and
+    k are also rotated by the pool's Hadamard matrix before the write.
     """
     T, H, KV = x.shape[0], config.num_heads, config.num_kv_heads
     qkv = linear(x, layer.qkv_proj, use_kernels=batch.use_kernels).view(T, H + 2 * KV, -1)
 
     if batch.use_kernels:  # everything up to the pool write, fused (kernels.py)
-        k_slots, v_slots = pool.layer_slots(layer_idx)
+        s = pool.layer_slots(layer_idx)
         q = kernels.qk_norm_rope_store(
             qkv, layer.q_norm, layer.k_norm, batch.positions, batch.slot_mapping, rope,
-            k_slots, v_slots, H, KV, config.rms_norm_eps,
+            s.k, s.v, H, KV, config.rms_norm_eps, s.k_scale, s.v_scale,
         )  # fmt: skip
     else:
         q, k, v = qkv.split([H, KV, KV], dim=1)
@@ -316,6 +328,8 @@ def attention_block(
         k = rms_norm(k, layer.k_norm, config.rms_norm_eps)
         q = apply_rope(q, *rope)
         k = apply_rope(k, *rope)
+        if pool.key_rotation is not None:  # int8 cache: attend in a rotated basis (kv_cache.py)
+            q, k = rotate(q, pool.key_rotation), rotate(k, pool.key_rotation)
         pool.write(layer_idx, k, v, batch.slot_mapping)
 
     out = paged_attention(q, pool, layer_idx, batch)  # [T, num_heads, head_dim]

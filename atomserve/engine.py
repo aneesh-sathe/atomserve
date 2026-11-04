@@ -246,13 +246,16 @@ def create_engine(
     With `draft` (a smaller model of the same family) and
     engine_config.num_speculative_tokens > 0, decoding is speculative: the draft gets
     its own KV pool with the same number of blocks, indexed by the same block tables.
+    engine_config.kv_dtype applies to every pool.
     """
     if (draft is not None) != (engine_config.num_speculative_tokens > 0):
         raise ValueError("speculative decoding needs both a draft model and num_speculative_tokens")
 
     def runner_for(w: Weights, config: ModelConfig) -> ModelRunner:
-        device, dtype = w.embed.device, w.embed.dtype
-        pool = KVPool(config, engine_config.num_blocks, engine_config.block_size, device, dtype)
+        pool = KVPool(
+            config, engine_config.num_blocks, engine_config.block_size, w.embed.device,
+            w.embed.dtype, quantized=engine_config.kv_dtype == "int8",
+        )  # fmt: skip
         return ModelRunner(w, config, pool)
 
     runner = runner_for(weights, model_config)

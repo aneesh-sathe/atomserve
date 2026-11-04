@@ -18,7 +18,7 @@ import time
 import torch
 
 from atomserve import __version__
-from atomserve.config import EngineConfig, ModelConfig
+from atomserve.config import KV_DTYPES, EngineConfig, ModelConfig
 from atomserve.engine import create_engine
 from atomserve.kv_cache import KVPool
 from atomserve.loader import default_device, load_weights, resolve_model_dir
@@ -52,9 +52,21 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["int8"],
         help="store weights as int8 (half the memory, faster small-batch decode)",
     )
-    parser.add_argument("--dtype", choices=DTYPES, default="bf16", help="weights and KV cache")
+    parser.add_argument(
+        "--dtype",
+        choices=DTYPES,
+        default="bf16",
+        help="weights, activations and (by default) the KV cache",
+    )
     parser.add_argument(
         "--kv-mem-gb", type=float, default=4.0, help="GiB of memory for the KV cache"
+    )
+    parser.add_argument(
+        "--kv-dtype",
+        choices=KV_DTYPES,
+        default="auto",
+        help="KV cache storage: auto (same as --dtype) or int8 (about 2x the context in "
+        "the same memory, faster long-context decode)",
     )
     parser.add_argument("--block-size", type=int, default=16, help="tokens per KV block")
     parser.add_argument(
@@ -92,8 +104,8 @@ def engine_config_for(
     With a draft model, every block exists in both models' pools, so a block costs both.
     """
     configs = [model_config] + ([draft_config] if draft_config else [])
-    dtype = DTYPES[args.dtype]
-    block_bytes = sum(KVPool.bytes_per_block(c, args.block_size, dtype) for c in configs)
+    dtype, quantized = DTYPES[args.dtype], args.kv_dtype == "int8"
+    block_bytes = sum(KVPool.bytes_per_block(c, args.block_size, dtype, quantized) for c in configs)
     num_blocks = int(args.kv_mem_gb * 2**30 // block_bytes)
     return EngineConfig(
         block_size=args.block_size,
@@ -103,6 +115,7 @@ def engine_config_for(
         max_model_len=min(model_config.max_position_embeddings, num_blocks * args.block_size),
         enable_prefix_caching=not args.no_prefix_caching,
         num_speculative_tokens=args.num_speculative_tokens if draft_config else 0,
+        kv_dtype=args.kv_dtype,
     )
 
 
@@ -130,8 +143,10 @@ def main(argv: list[str] | None = None) -> int:
     model_dir = resolve_model_dir(args.model)
     model_config = ModelConfig.load(model_dir)
     device = default_device()
-    weight_format = f"{args.quantize} weights" if args.quantize else args.dtype
-    print(f"Loading {args.model} ({weight_format}, {device.type}) ...", flush=True)
+    formats = [f"{args.quantize} weights" if args.quantize else args.dtype]
+    if args.kv_dtype != "auto":
+        formats.append(f"{args.kv_dtype} KV cache")
+    print(f"Loading {args.model} ({', '.join(formats)}, {device.type}) ...", flush=True)
     weights = load_weights(model_dir, model_config, device, DTYPES[args.dtype], args.quantize)
     tokenizer = ChatTokenizer(model_dir)
     draft = None

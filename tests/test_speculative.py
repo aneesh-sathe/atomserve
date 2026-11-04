@@ -62,6 +62,13 @@ def test_greedy_speculation_equals_the_target_alone(models, setting):
     assert stats["kv_blocks_used"] == 0  # everything freed
 
 
+def test_greedy_speculation_with_an_int8_cache_equals_the_target_alone(models):
+    """Both pools int8: the draft's guesses still never change the target's tokens."""
+    target, draft = models
+    expected = tiny_engine(target, kv_dtype="int8").generate(PROMPTS, GREEDY)
+    assert tiny_engine(target, draft, kv_dtype="int8").generate(PROMPTS, GREEDY) == expected
+
+
 def test_speculation_pauses_for_big_batches_and_the_draft_catches_up(models):
     """With max_speculative_batch=2, five requests decode plainly (the draft idles and
     falls behind); as the short ones finish, the rest speculate after the draft catches

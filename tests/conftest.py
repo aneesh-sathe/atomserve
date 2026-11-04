@@ -78,18 +78,19 @@ def tiny_weights() -> Weights:
 
 @pytest.fixture(scope="session")
 def full_logits() -> Callable[[Weights, ModelConfig, list[int]], torch.Tensor]:
-    """f(weights, config, ids) -> logits at every position [len(ids), vocab], on CPU.
+    """f(weights, config, ids, quantized=False) -> logits at every position [len(ids), vocab].
 
-    Runs `ids` as one fresh prefill in a throwaway pool, asking for a logits row
-    per token instead of just the last one: the uncached reference that cached,
-    paged and batched runs are compared against.
+    Runs `ids` as one fresh prefill in a throwaway pool (int8 if `quantized`), asking
+    for a logits row per token instead of just the last one: the uncached reference
+    that cached, paged and batched runs are compared against. Returned on the CPU.
     """
 
-    def run(weights: Weights, config: ModelConfig, ids: list[int]) -> torch.Tensor:
+    def run(weights: Weights, config: ModelConfig, ids: list[int], quantized: bool = False):
         block_size = 16
         num_blocks = blocks_for_tokens(len(ids), block_size)
         device, dtype = weights.embed.device, weights.embed.dtype
-        runner = ModelRunner(weights, config, KVPool(config, num_blocks, block_size, device, dtype))
+        pool = KVPool(config, num_blocks, block_size, device, dtype, quantized)
+        runner = ModelRunner(weights, config, pool)
         row = Row(list(ids), 0, list(range(num_blocks)), num_logits=len(ids))
         logits, _ = runner.forward([row])
         return logits.cpu()

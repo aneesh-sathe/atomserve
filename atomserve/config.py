@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 SUPPORTED_ARCHITECTURE = "Qwen3ForCausalLM"
+KV_DTYPES = ("auto", "int8")
 
 
 @dataclass(frozen=True)
@@ -76,6 +77,7 @@ class EngineConfig:
     enable_prefix_caching: bool = True  # reuse KV blocks of identical prompt prefixes
     num_speculative_tokens: int = 0  # tokens a draft model proposes per step (0: off)
     max_speculative_batch: int = 2  # speculate only while at most this many sequences run
+    kv_dtype: str = "auto"  # KV cache storage: "auto" (the model's dtype) or "int8"
 
     def __post_init__(self) -> None:
         if self.max_model_len > self.num_blocks * self.block_size:
@@ -84,5 +86,7 @@ class EngineConfig:
                 f"max_model_len {self.max_model_len} exceeds KV pool capacity "
                 f"{self.num_blocks * self.block_size} tokens"
             )
+        if self.kv_dtype not in KV_DTYPES:
+            raise ValueError(f"kv_dtype must be one of {KV_DTYPES}, got {self.kv_dtype!r}")
         if self.max_num_batched_tokens < self.max_num_seqs:
             raise ValueError("max_num_batched_tokens must be >= max_num_seqs (one decode each)")
